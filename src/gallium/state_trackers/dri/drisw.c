@@ -48,6 +48,8 @@
 #include "dri_drawable.h"
 #include "dri_query_renderer.h"
 
+#include "drm_driver.h"
+
 DEBUG_GET_ONCE_BOOL_OPTION(swrast_no_present, "SWRAST_NO_PRESENT", FALSE);
 static boolean swrast_no_present = FALSE;
 
@@ -361,47 +363,125 @@ drisw_update_tex_buffer(struct dri_drawable *drawable,
    pipe_transfer_unmap(pipe, transfer);
 }
 
-extern __DRIimage *dri2_create_from_texture(__DRIcontext *context, int target, unsigned texture,
-                                            int depth, int level, unsigned *error,
-                                            void *loaderPrivate);
-extern __DRIimage *dri2_lookup_egl_image(struct dri_screen *screen, void *handle);
-extern void dri2_destroy_image(__DRIimage *img);
-extern int convert_to_fourcc(int format);
-extern __DRIimage *dri2_create_image_from_winsys(__DRIscreen *_screen,
-                                                 int width, int height, int format,
-                                                 int num_handles, struct winsys_handle *whandle,
-                                                 void *loaderPrivate);
-extern __DRI2fenceExtension dri2FenceExtension;
 
-
-static GLboolean
-drisw_query_image(__DRIimage *image, int attrib, int *value)
+static __DRIimage *
+drisw_lookup_egl_image(struct dri_screen *screen, void *handle)
 {
-   switch (attrib) {
-   case __DRI_IMAGE_ATTRIB_FORMAT:
-      *value = image->dri_format;
-      return GL_TRUE;
-   case __DRI_IMAGE_ATTRIB_WIDTH:
-      *value = image->texture->width0;
-      return GL_TRUE;
-   case __DRI_IMAGE_ATTRIB_HEIGHT:
-      *value = image->texture->height0;
-      return GL_TRUE;
-   case __DRI_IMAGE_ATTRIB_COMPONENTS:
-      if (image->dri_components == 0)
-         return GL_FALSE;
-      *value = image->dri_components;
-      return GL_TRUE;
-   case __DRI_IMAGE_ATTRIB_NUM_PLANES:
-      *value = 1;
-      return GL_TRUE;
-   case __DRI_IMAGE_ATTRIB_FOURCC:
-      *value = convert_to_fourcc(image->dri_format);
-      return GL_TRUE;
-   default:
-      return GL_FALSE;
-   }
+   const __DRIimageLookupExtension *loader = screen->sPriv->dri2.image;
+   __DRIimage *img;
+
+   if (!loader->lookupEGLImage)
+      return NULL;
+
+   img = loader->lookupEGLImage(screen->sPriv,
+            handle, screen->sPriv->loaderPrivate);
+
+   return img;
 }
+
+static __DRIimage *
+drisw_create_image_from_dma_bufs(__DRIscreen *screen,
+                                 int width, int height, int fourcc,
+                                 int *fds, int num_fds,
+                                 int *strides, int *offsets,
+                                 enum __DRIYUVColorSpace color_space,
+                                 enum __DRISampleRange sample_range,
+                                 enum __DRIChromaSiting horiz_siting,
+                                 enum __DRIChromaSiting vert_siting,
+                                 unsigned *error,
+                                 void *loaderPrivate)
+{
+   struct dri_screen *ds = dri_screen(screen);
+   struct pipe_screen *ps = ds->base.screen;
+   uint32_t dri_format;
+
+   struct pipe_resource templat;
+   memset(&templat, 0, sizeof(templat));
+
+   templat.target = PIPE_TEXTURE_2D;
+   switch (fourcc) {
+   case __DRI_IMAGE_FOURCC_ARGB8888:
+      dri_format =  __DRI_IMAGE_FORMAT_ARGB8888;
+      templat.format = PIPE_FORMAT_BGRA8888_UNORM;
+      break;
+   case __DRI_IMAGE_FOURCC_XRGB8888:
+      dri_format =  __DRI_IMAGE_FORMAT_XRGB8888;
+      templat.format = PIPE_FORMAT_BGRX8888_UNORM;
+      break;
+   case __DRI_IMAGE_FOURCC_ABGR8888:
+   dri_format =  __DRI_IMAGE_FORMAT_ABGR8888;
+      templat.format = PIPE_FORMAT_RGBA8888_UNORM;
+      break;
+   case __DRI_IMAGE_FOURCC_XBGR8888:
+      dri_format =  __DRI_IMAGE_FORMAT_XBGR8888;
+      templat.format = PIPE_FORMAT_RGBX8888_UNORM;
+      break;
+   default:
+      if (error)
+         *error = __DRI_IMAGE_ERROR_BAD_MATCH;
+      return NULL;
+   }
+
+   templat.width0 = width;
+   templat.height0 = height;
+   templat.depth0 = 1;
+   templat.array_size = 1;
+
+   templat.last_level = 0;
+   templat.nr_samples = 0;
+   templat.usage = PIPE_USAGE_DEFAULT;
+
+   templat.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_DISPLAY_TARGET |
+                  PIPE_BIND_SAMPLER_VIEW;
+   templat.flags = 0;
+
+   struct winsys_handle handle;
+   memset(&handle, 0, sizeof(handle));
+   handle.type = DRM_API_HANDLE_TYPE_FD;
+   handle.handle = fds[0];
+   handle.stride = strides[0];
+
+   __DRIimage * img = CALLOC_STRUCT(__DRIimageRec);
+   if (!img) {
+      if (error)
+         *error = __DRI_IMAGE_ERROR_BAD_ALLOC;
+      return NULL;
+   }
+
+   img->texture = ps->resource_from_handle(ps, &templat, &handle,
+                                           PIPE_HANDLE_USAGE_READ_WRITE);
+
+   if (!img->texture) {
+      FREE(img);
+      if (error)
+         *error = __DRI_IMAGE_ERROR_BAD_MATCH;
+      return NULL;
+   }
+
+   img->level = 0;
+   img->layer = 0;
+   img->dri_format = dri_format;
+   img->loader_private = loaderPrivate;
+
+   if (error)
+      *error = __DRI_IMAGE_ERROR_SUCCESS;
+
+   return img;
+}
+
+static void
+drisw_destroy_image(__DRIimage *img)
+{
+   pipe_resource_reference(&img->texture, NULL);
+   FREE(img);
+}
+
+static __DRIimageExtension dri2ImageExtension = {
+    .base = { __DRI_IMAGE, 8 },
+
+    .createImageFromDmaBufs = drisw_create_image_from_dma_bufs,
+    .destroyImage = drisw_destroy_image,
+};
 
 /*
  * Backend function for init_screen.
@@ -419,8 +499,9 @@ static const __DRIextension *drisw_screen_extensions[] = {
    &driTexBufferExtension.base,
    &dri2RendererQueryExtension.base,
    &dri2ConfigQueryExtension.base,
-   &driswImageExtension.base,
-   &dri2FenceExtension.base,
+#ifdef HAVE_LIBDRM
+   &dri2ImageExtension.base,
+#endif
    NULL
 };
 
@@ -459,8 +540,7 @@ drisw_init_screen(__DRIscreen * sPriv)
    if (!configs)
       goto fail;
 
-   screen->lookup_egl_image = dri2_lookup_egl_image;
-   driSWRastExtension.createImageFromWinsys = dri2_create_image_from_winsys;
+   screen->lookup_egl_image = drisw_lookup_egl_image;
 
    return configs;
 fail:

@@ -1086,7 +1086,7 @@ brwCreateContext(gl_api api,
 
    intel_batchbuffer_init(&brw->batch, brw->bufmgr, brw->has_llc);
 
-   if (brw->gen >= 6) {
+   if (brw->gen >= 7) {
       /* Create a new hardware context.  Using a hardware context means that
        * our GPU state will be saved/restored on context switch, allowing us
        * to assume that the GPU is in the same state we left it in.
@@ -1096,11 +1096,11 @@ brwCreateContext(gl_api api,
        */
       brw->hw_ctx = drm_intel_gem_context_create(brw->bufmgr);
 
-      if (!brw->hw_ctx) {
-         fprintf(stderr, "Failed to create hardware context.\n");
+/*      if (!brw->hw_ctx) {
+         fprintf(stderr, "Gen6+ requires Kernel 3.6 or later.\n");
          intelDestroyContext(driContextPriv);
          return false;
-      }
+      }*/
    }
 
    if (brw_init_pipe_control(brw, devinfo)) {

@@ -434,6 +434,7 @@ static const struct dri2_extension_match optional_core_extensions[] = {
    { __DRI2_FENCE, 1, offsetof(struct dri2_egl_display, fence) },
    { __DRI2_RENDERER_QUERY, 1, offsetof(struct dri2_egl_display, rendererQuery) },
    { __DRI2_INTEROP, 1, offsetof(struct dri2_egl_display, interop) },
+   { __DRI_IMAGE, 1, offsetof(struct dri2_egl_display, image) },
    { NULL, 0, 0 }
 };
 
@@ -717,7 +718,7 @@ dri2_setup_screen(_EGLDisplay *disp)
       if (dri2_renderer_query_integer(dri2_dpy,
                                       __DRI2_RENDERER_HAS_TEXTURE_3D))
          disp->Extensions.KHR_gl_texture_3D_image = EGL_TRUE;
-#ifdef HAVE_LIBDRM
+#if defined(HAVE_LIBDRM) || defined(HAVE_SURFACELESS_PLATFORM)
       if (dri2_dpy->image->base.version >= 8 &&
           dri2_dpy->image->createImageFromDmaBufs) {
          disp->Extensions.EXT_image_dma_buf_import = EGL_TRUE;
