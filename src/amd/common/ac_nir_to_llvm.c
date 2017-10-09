@@ -1135,7 +1135,17 @@ static LLVMValueRef emit_find_lsb(struct nir_to_llvm_context *ctx,
 		 */
 		LLVMConstInt(ctx->i32, 1, false),
 	};
-	return ac_build_intrinsic(&ctx->ac, "llvm.cttz.i32", ctx->i32, params, 2, AC_FUNC_ATTR_READNONE);
+
+	LLVMValueRef lsb = ac_build_intrinsic(&ctx->ac, "llvm.cttz.i32", ctx->i32,
+					      params, 2,
+					      AC_FUNC_ATTR_READNONE);
+
+	/* TODO: We need an intrinsic to skip this conditional. */
+	/* Check for zero: */
+	return LLVMBuildSelect(ctx->builder, LLVMBuildICmp(ctx->builder,
+							   LLVMIntEQ, src0,
+							   ctx->i32zero, ""),
+			       LLVMConstInt(ctx->i32, -1, 0), lsb, "");
 }
 
 static LLVMValueRef emit_ifind_msb(struct nir_to_llvm_context *ctx,
@@ -1239,7 +1249,6 @@ static LLVMValueRef emit_f2f16(struct nir_to_llvm_context *ctx,
 	src0 = to_float(ctx, src0);
 	result = LLVMBuildFPTrunc(ctx->builder, src0, ctx->f16, "");
 
-	/* TODO SI/CIK options here */
 	if (ctx->options->chip_class >= VI) {
 		LLVMValueRef args[2];
 		/* Check if the result is a denormal - and flush to 0 if so. */
@@ -1253,7 +1262,22 @@ static LLVMValueRef emit_f2f16(struct nir_to_llvm_context *ctx,
 
 	if (ctx->options->chip_class >= VI)
 		result = LLVMBuildSelect(ctx->builder, cond, ctx->f32zero, result, "");
-
+	else {
+		/* for SI/CIK */
+		/* 0x38800000 is smallest half float value (2^-14) in 32-bit float,
+		 * so compare the result and flush to 0 if it's smaller.
+		 */
+		LLVMValueRef temp, cond2;
+		temp = emit_intrin_1f_param(&ctx->ac, "llvm.fabs",
+					    ctx->f32, result);
+		cond = LLVMBuildFCmp(ctx->builder, LLVMRealUGT,
+				     LLVMBuildBitCast(ctx->builder, LLVMConstInt(ctx->i32, 0x38800000, false), ctx->f32, ""),
+				     temp, "");
+		cond2 = LLVMBuildFCmp(ctx->builder, LLVMRealUNE,
+				      temp, ctx->f32zero, "");
+		cond = LLVMBuildAnd(ctx->builder, cond, cond2, "");
+		result = LLVMBuildSelect(ctx->builder, cond, ctx->f32zero, result, "");
+	}
 	return result;
 }
 
@@ -3276,7 +3300,10 @@ static void visit_image_store(struct nir_to_llvm_context *ctx,
 	char intrinsic_name[64];
 	const nir_variable *var = instr->variables[0]->var;
 	const struct glsl_type *type = glsl_without_array(var->type);
-
+	LLVMValueRef glc = ctx->i1false;
+	bool force_glc = ctx->options->chip_class == SI;
+	if (force_glc)
+		glc = ctx->i1true;
 	if (ctx->stage == MESA_SHADER_FRAGMENT)
 		ctx->shader_info->fs.writes_memory = true;
 
@@ -3286,7 +3313,7 @@ static void visit_image_store(struct nir_to_llvm_context *ctx,
 		params[2] = LLVMBuildExtractElement(ctx->builder, get_src(ctx, instr->src[0]),
 						    LLVMConstInt(ctx->i32, 0, false), ""); /* vindex */
 		params[3] = LLVMConstInt(ctx->i32, 0, false); /* voffset */
-		params[4] = ctx->i1false;  /* glc */
+		params[4] = glc;  /* glc */
 		params[5] = ctx->i1false;  /* slc */
 		ac_build_intrinsic(&ctx->ac, "llvm.amdgcn.buffer.store.format.v4f32", ctx->voidt,
 				   params, 6, 0);
@@ -3294,7 +3321,6 @@ static void visit_image_store(struct nir_to_llvm_context *ctx,
 		bool is_da = glsl_sampler_type_is_array(type) ||
 			     glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_CUBE;
 		LLVMValueRef da = is_da ? ctx->i1true : ctx->i1false;
-		LLVMValueRef glc = ctx->i1false;
 		LLVMValueRef slc = ctx->i1false;
 
 		params[0] = to_float(ctx, get_src(ctx, instr->src[2]));
@@ -3329,7 +3355,7 @@ static void visit_image_store(struct nir_to_llvm_context *ctx,
 static LLVMValueRef visit_image_atomic(struct nir_to_llvm_context *ctx,
                                        nir_intrinsic_instr *instr)
 {
-	LLVMValueRef params[6];
+	LLVMValueRef params[7];
 	int param_count = 0;
 	const nir_variable *var = instr->variables[0]->var;
 
@@ -4307,15 +4333,13 @@ static void visit_tex(struct nir_to_llvm_context *ctx, nir_tex_instr *instr)
 	}
 
 	if (instr->sampler_dim == GLSL_SAMPLER_DIM_CUBE && coord) {
-		if (instr->is_array && instr->op != nir_texop_lod)
-			coords[3] = apply_round_slice(ctx, coords[3]);
 		for (chan = 0; chan < instr->coord_components; chan++)
 			coords[chan] = to_float(ctx, coords[chan]);
 		if (instr->coord_components == 3)
 			coords[3] = LLVMGetUndef(ctx->f32);
 		ac_prepare_cube_coords(&ctx->ac,
 			instr->op == nir_texop_txd, instr->is_array,
-			coords, derivs);
+			instr->op == nir_texop_lod, coords, derivs);
 		if (num_deriv_comp)
 			num_deriv_comp--;
 	}
@@ -5589,10 +5613,11 @@ si_export_mrt_z(struct nir_to_llvm_context *ctx,
 		args.enabled_channels |= 0x4;
 	}
 
-	/* SI (except OLAND) has a bug that it only looks
+	/* SI (except OLAND and HAINAN) has a bug that it only looks
 	 * at the X writemask component. */
 	if (ctx->options->chip_class == SI &&
-	    ctx->options->family != CHIP_OLAND)
+	    ctx->options->family != CHIP_OLAND &&
+	    ctx->options->family != CHIP_HAINAN)
 		args.enabled_channels |= 0x1;
 
 	ac_build_export(&ctx->ac, &args);
