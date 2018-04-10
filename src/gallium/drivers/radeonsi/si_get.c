@@ -1,5 +1,6 @@
 /*
  * Copyright 2017 Advanced Micro Devices, Inc.
+ * All Rights Reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -191,6 +192,7 @@ static int si_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
 	case PIPE_CAP_TGSI_ANY_REG_AS_ADDRESS:
 	case PIPE_CAP_SIGNED_VERTEX_BUFFER_OFFSET:
 	case PIPE_CAP_TGSI_VOTE:
+	case PIPE_CAP_TGSI_FS_FBFETCH:
 		return 1;
 
 	case PIPE_CAP_TGSI_BALLOT:
@@ -212,7 +214,7 @@ static int si_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
 		       sscreen->info.drm_major == 3;
 
         case PIPE_CAP_MIN_MAP_BUFFER_ALIGNMENT:
-                return R600_MAP_BUFFER_ALIGNMENT;
+                return SI_MAP_BUFFER_ALIGNMENT;
 
 	case PIPE_CAP_CONSTANT_BUFFER_OFFSET_ALIGNMENT:
 	case PIPE_CAP_TEXTURE_BUFFER_OFFSET_ALIGNMENT:
@@ -267,7 +269,6 @@ static int si_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
 	case PIPE_CAP_VERTEXID_NOBASE:
 	case PIPE_CAP_PRIMITIVE_RESTART_FOR_PATCHES:
 	case PIPE_CAP_MAX_WINDOW_RECTANGLES:
-	case PIPE_CAP_TGSI_FS_FBFETCH:
 	case PIPE_CAP_TGSI_MUL_ZERO_WINS:
 	case PIPE_CAP_UMA:
 	case PIPE_CAP_POLYGON_MODE_FILL_RECTANGLE:
@@ -281,7 +282,7 @@ static int si_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
 		return sscreen->info.has_syncobj;
 
 	case PIPE_CAP_CONSTBUF0_FLAGS:
-		return R600_RESOURCE_FLAG_32BIT;
+		return SI_RESOURCE_FLAG_32BIT;
 
 	case PIPE_CAP_NATIVE_FENCE_FD:
 		return sscreen->info.has_fence_to_handle;

@@ -291,6 +291,9 @@ struct radv_physical_device {
 	bool cpdma_prefetch_writes_memory;
 	bool has_scissor_bug;
 
+	bool has_out_of_order_rast;
+	bool out_of_order_rast_allowed;
+
 	/* This is the drivers on-disk cache used as a fallback as opposed to
 	 * the pipeline cache defined by apps.
 	 */
@@ -912,12 +915,13 @@ struct radv_descriptor_state {
 
 struct radv_cmd_state {
 	/* Vertex descriptors */
-	bool                                          vb_prefetch_dirty;
 	uint64_t                                      vb_va;
 	unsigned                                      vb_size;
 
 	bool predicating;
 	uint32_t                                      dirty;
+
+	uint32_t                                      prefetch_L2_mask;
 
 	struct radv_pipeline *                        pipeline;
 	struct radv_pipeline *                        emitted_pipeline;
@@ -942,6 +946,7 @@ struct radv_cmd_state {
 	uint32_t                                     last_primitive_reset_index;
 	enum radv_cmd_flush_bits                     flush_bits;
 	unsigned                                     active_occlusion_queries;
+	bool                                         perfect_occlusion_queries_enabled;
 	float					     offset_scale;
 	uint32_t                                      trace_id;
 	uint32_t                                      last_ia_multi_vgt_param;
@@ -1232,6 +1237,7 @@ struct radv_pipeline {
 			struct radv_prim_vertex_count prim_vertex_count;
  			bool can_use_guardband;
 			uint32_t needed_dynamic_state;
+			bool disable_out_of_order_rast_for_occlusion;
 		} graphics;
 	};
 
@@ -1378,16 +1384,68 @@ bool radv_layout_dcc_compressed(const struct radv_image *image,
 			        VkImageLayout layout,
 			        unsigned queue_mask);
 
+/**
+ * Return whether the image has CMASK metadata for color surfaces.
+ */
 static inline bool
-radv_vi_dcc_enabled(const struct radv_image *image, unsigned level)
+radv_image_has_cmask(const struct radv_image *image)
 {
-	return image->surface.dcc_size && level < image->surface.num_dcc_levels;
+	return image->cmask.size;
 }
 
+/**
+ * Return whether the image has FMASK metadata for color surfaces.
+ */
+static inline bool
+radv_image_has_fmask(const struct radv_image *image)
+{
+	return image->fmask.size;
+}
+
+/**
+ * Return whether the image has DCC metadata for color surfaces.
+ */
+static inline bool
+radv_image_has_dcc(const struct radv_image *image)
+{
+	return image->surface.dcc_size;
+}
+
+/**
+ * Return whether DCC metadata is enabled for a level.
+ */
+static inline bool
+radv_dcc_enabled(const struct radv_image *image, unsigned level)
+{
+	return radv_image_has_dcc(image) &&
+	       level < image->surface.num_dcc_levels;
+}
+
+/**
+ * Return whether the image has HTILE metadata for depth surfaces.
+ */
+static inline bool
+radv_image_has_htile(const struct radv_image *image)
+{
+	return image->surface.htile_size;
+}
+
+/**
+ * Return whether HTILE metadata is enabled for a level.
+ */
 static inline bool
 radv_htile_enabled(const struct radv_image *image, unsigned level)
 {
-	return image->surface.htile_size && level == 0;
+	return radv_image_has_htile(image) && level == 0;
+}
+
+/**
+ * Return whether the image is TC-compatible HTILE.
+ */
+static inline bool
+radv_image_is_tc_compat_htile(const struct radv_image *image)
+{
+	return radv_image_has_htile(image) && image->tc_compatible_htile;
 }
 
 unsigned radv_image_queue_family_mask(const struct radv_image *image, uint32_t family, uint32_t queue_family);
