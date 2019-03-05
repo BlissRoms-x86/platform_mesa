@@ -98,13 +98,9 @@ define mesa-build-with-llvm
     $(warning Unsupported LLVM version in Android $(MESA_ANDROID_MAJOR_VERSION)),) \
   $(if $(filter 6,$(MESA_ANDROID_MAJOR_VERSION)), \
     $(eval LOCAL_CFLAGS += -DHAVE_LLVM=0x0307 -DMESA_LLVM_VERSION_PATCH=0)) \
-  $(if $(filter 7,$(MESA_ANDROID_MAJOR_VERSION)), \
-    $(eval LOCAL_CFLAGS += -DHAVE_LLVM=0x0700 -DMESA_LLVM_VERSION_PATCH=0)) \
-  $(if $(filter 8,$(MESA_ANDROID_MAJOR_VERSION)), \
-    $(eval LOCAL_CFLAGS += -DHAVE_LLVM=0x0700 -DMESA_LLVM_VERSION_PATCH=0)) \
-  $(if $(filter P,$(MESA_ANDROID_MAJOR_VERSION)), \
-    $(eval LOCAL_CFLAGS += -DHAVE_LLVM=0x0309 -DMESA_LLVM_VERSION_PATCH=0)) \
-  $(eval LOCAL_SHARED_LIBRARIES += libLLVM70)
+  $(if $(filter 7 8 9,$(MESA_ANDROID_MAJOR_VERSION)), \
+    $(eval LOCAL_CFLAGS += -DHAVE_LLVM=0x0800 -DMESA_LLVM_VERSION_PATCH=0)) \
+  $(eval LOCAL_SHARED_LIBRARIES += libLLVM80)
 endef
 
 # add subdirectories
