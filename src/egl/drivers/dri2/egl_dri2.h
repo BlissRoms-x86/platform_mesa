@@ -69,6 +69,10 @@ struct zwp_linux_dmabuf_v1;
 #include <hardware/gralloc.h>
 #endif /* HAVE_ANDROID_PLATFORM */
 
+#ifdef HAVE_GRALLOC1
+#include <hardware/gralloc1.h>
+#endif
+
 #include "eglconfig.h"
 #include "eglcontext.h"
 #include "egldevice.h"
@@ -239,6 +243,13 @@ struct dri2_egl_display
 
 #ifdef HAVE_ANDROID_PLATFORM
    const gralloc_module_t *gralloc;
+   uint16_t gralloc_version;
+#ifdef HAVE_GRALLOC1
+   gralloc1_device_t *gralloc1_dvc;
+   GRALLOC1_PFN_LOCK_FLEX pfn_lockflex;
+   GRALLOC1_PFN_GET_FORMAT pfn_getFormat;
+   GRALLOC1_PFN_UNLOCK pfn_unlock;
+#endif
 #endif
 
    bool                      is_render_node;
@@ -539,6 +550,11 @@ dri2_init_surface(_EGLSurface *surf, _EGLDisplay *disp, EGLint type,
 
 void
 dri2_fini_surface(_EGLSurface *surf);
+
+EGLBoolean
+dri2_create_drawable(struct dri2_egl_display *dri2_dpy,
+                     const __DRIconfig *config,
+                     struct dri2_egl_surface *dri2_surf);
 
 static inline uint64_t
 combine_u32_into_u64(uint32_t hi, uint32_t lo)
