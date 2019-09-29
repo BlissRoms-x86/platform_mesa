@@ -147,10 +147,20 @@ lower_deref(nir_builder *b, struct lower_samplers_as_deref_state *state,
 
    remove_struct_derefs_prep(path.path, &name, &location, &type);
 
-   assert(location < state->shader_program->data->NumUniformStorage &&
-          state->shader_program->data->UniformStorage[location].opaque[stage].active);
+   if (state->shader_program && var->data.how_declared != nir_var_hidden) {
+      /* For GLSL programs, look up the bindings in the uniform storage. */
+      assert(location < state->shader_program->data->NumUniformStorage &&
+             state->shader_program->data->UniformStorage[location].opaque[stage].active);
 
-   binding = state->shader_program->data->UniformStorage[location].opaque[stage].index;
+      binding = state->shader_program->data->UniformStorage[location].opaque[stage].index;
+   } else {
+      /* For ARB programs, built-in shaders, or internally generated sampler
+       * variables in GLSL programs, assume that whoever created the shader
+       * set the bindings correctly already.
+       */
+      assert(var->data.explicit_binding);
+      binding = var->data.binding;
+   }
 
    if (var->type == type) {
       /* Fast path: We did not encounter any struct derefs. */

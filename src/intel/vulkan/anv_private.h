@@ -120,12 +120,9 @@ struct gen_l3_config;
 #define INSTRUCTION_STATE_POOL_MIN_ADDRESS 0x000180000000ULL /* 6 GiB */
 #define INSTRUCTION_STATE_POOL_MAX_ADDRESS 0x0001bfffffffULL
 #define HIGH_HEAP_MIN_ADDRESS              0x0001c0000000ULL /* 7 GiB */
-#define HIGH_HEAP_MAX_ADDRESS              0xfffeffffffffULL
 
 #define LOW_HEAP_SIZE               \
    (LOW_HEAP_MAX_ADDRESS - LOW_HEAP_MIN_ADDRESS + 1)
-#define HIGH_HEAP_SIZE              \
-   (HIGH_HEAP_MAX_ADDRESS - HIGH_HEAP_MIN_ADDRESS + 1)
 #define DYNAMIC_STATE_POOL_SIZE     \
    (DYNAMIC_STATE_POOL_MAX_ADDRESS - DYNAMIC_STATE_POOL_MIN_ADDRESS + 1)
 #define BINDING_TABLE_POOL_SIZE     \
@@ -745,7 +742,7 @@ struct anv_state_table {
    struct anv_free_entry *map;
    uint32_t size;
    struct anv_block_state state;
-   struct u_vector mmap_cleanups;
+   struct u_vector cleanups;
 };
 
 struct anv_state_pool {
@@ -906,6 +903,8 @@ struct anv_memory_heap {
    VkMemoryHeapFlags flags;
 
    /* Driver-internal book-keeping */
+   uint64_t          vma_start;
+   uint64_t          vma_size;
    bool              supports_48bit_addresses;
 };
 
@@ -3063,7 +3062,13 @@ anv_can_sample_with_hiz(const struct gen_device_info * const devinfo,
    if (!(image->aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
       return false;
 
-   if (devinfo->gen < 8)
+   /* Allow this feature on BDW even though it is disabled in the BDW devinfo
+    * struct. There's documentation which suggests that this feature actually
+    * reduces performance on BDW, but it has only been observed to help so
+    * far. Sampling fast-cleared blocks on BDW must also be handled with care
+    * (see depth_stencil_attachment_compute_aux_usage() for more info).
+    */
+   if (devinfo->gen != 8 && !devinfo->has_sample_with_hiz)
       return false;
 
    return image->samples == 1;
