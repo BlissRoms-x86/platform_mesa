@@ -58,9 +58,20 @@ LOCAL_SHARED_LIBRARIES := \
 	libcutils \
 	libsync
 
+ifeq ($(shell test $(PLATFORM_SDK_VERSION) -ge 27; echo $$?), 0)
+LOCAL_C_INCLUDES += \
+	frameworks/native/libs/nativewindow/include \
+	frameworks/native/libs/arect/include
+LOCAL_HEADER_LIBRARIES += libnativebase_headers
+endif
+
 ifeq ($(BOARD_USES_DRM_GRALLOC),true)
 	LOCAL_CFLAGS += -DHAVE_DRM_GRALLOC
 	LOCAL_SHARED_LIBRARIES += libgralloc_drm
+endif
+
+ifeq ($(strip $(BOARD_USES_GRALLOC1)),true)
+LOCAL_CFLAGS += -DHAVE_GRALLOC1
 endif
 
 ifeq ($(filter $(MESA_ANDROID_MAJOR_VERSION), 4 5 6 7),)
@@ -80,6 +91,6 @@ endif
 
 LOCAL_MODULE := libGLES_mesa
 LOCAL_MODULE_RELATIVE_PATH := egl
-
+LOCAL_CFLAGS += -Wno-error
 include $(MESA_COMMON_MK)
 include $(BUILD_SHARED_LIBRARY)
