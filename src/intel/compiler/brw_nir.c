@@ -781,6 +781,17 @@ brw_preprocess_nir(const struct brw_compiler *compiler, nir_shader *nir)
 
    OPT(brw_nir_lower_mem_access_bit_sizes);
 
+   /* Lower array derefs of vectors for SSBO and UBO loads.  For both UBOs and
+    * SSBOs, our back-end is capable of loading an entire vec4 at a time and
+    * we would like to take advantage of that whenever possible regardless of
+    * whether or not the app gives us full loads.  This should allow the
+    * optimizer to combine UBO and SSBO load operations and save us some send
+    * messages.
+    */
+   OPT(nir_lower_array_deref_of_vec,
+       nir_var_mem_ubo | nir_var_mem_ssbo,
+       nir_lower_direct_array_deref_of_vec_load);
+
    /* Get rid of split copies */
    nir = brw_nir_optimize(nir, compiler, is_scalar, false);
 
@@ -828,6 +839,23 @@ brw_nir_link_shaders(const struct brw_compiler *compiler,
 
       *producer = brw_nir_optimize(*producer, compiler, p_is_scalar, false);
       *consumer = brw_nir_optimize(*consumer, compiler, c_is_scalar, false);
+   }
+
+   NIR_PASS_V(*producer, nir_lower_io_to_vector, nir_var_shader_out);
+   NIR_PASS_V(*consumer, nir_lower_io_to_vector, nir_var_shader_in);
+
+   if ((*producer)->info.stage != MESA_SHADER_TESS_CTRL) {
+      /* Calling lower_io_to_vector creates output variable writes with
+       * write-masks.  On non-TCS outputs, the back-end can't handle it and we
+       * need to call nir_lower_io_to_temporaries to get rid of them.  This,
+       * in turn, creates temporary variables and extra copy_deref intrinsics
+       * that we need to clean up.
+       */
+      NIR_PASS_V(*producer, nir_lower_io_to_temporaries,
+                 nir_shader_get_entrypoint(*producer), true, false);
+      NIR_PASS_V(*producer, nir_lower_global_vars_to_local);
+      NIR_PASS_V(*producer, nir_split_var_copies);
+      NIR_PASS_V(*producer, nir_lower_var_copies);
    }
 }
 
@@ -919,7 +947,9 @@ brw_nir_apply_sampler_key(nir_shader *nir,
                           bool is_scalar)
 {
    const struct gen_device_info *devinfo = compiler->devinfo;
-   nir_lower_tex_options tex_options = { 0 };
+   nir_lower_tex_options tex_options = {
+      .lower_txd_clamp_if_sampler_index_not_lt_16 = true,
+   };
 
    /* Iron Lake and prior require lowering of all rectangle textures */
    if (devinfo->gen < 6)

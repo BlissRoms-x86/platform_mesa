@@ -2910,6 +2910,16 @@ void nir_fixup_deref_modes(nir_shader *shader);
 
 bool nir_lower_global_vars_to_local(nir_shader *shader);
 
+typedef enum {
+   nir_lower_direct_array_deref_of_vec_load     = (1 << 0),
+   nir_lower_indirect_array_deref_of_vec_load   = (1 << 1),
+   nir_lower_direct_array_deref_of_vec_store    = (1 << 2),
+   nir_lower_indirect_array_deref_of_vec_store  = (1 << 3),
+} nir_lower_array_deref_of_vec_options;
+
+bool nir_lower_array_deref_of_vec(nir_shader *shader, nir_variable_mode modes,
+                                  nir_lower_array_deref_of_vec_options options);
+
 bool nir_lower_indirect_derefs(nir_shader *shader, nir_variable_mode modes);
 
 bool nir_lower_locals_to_regs(nir_shader *shader);
@@ -2998,6 +3008,7 @@ void nir_lower_io_arrays_to_elements_no_indirects(nir_shader *shader,
                                                   bool outputs_only);
 void nir_lower_io_to_scalar(nir_shader *shader, nir_variable_mode mask);
 void nir_lower_io_to_scalar_early(nir_shader *shader, nir_variable_mode mask);
+bool nir_lower_io_to_vector(nir_shader *shader, nir_variable_mode mask);
 
 typedef struct nir_lower_subgroups_options {
    uint8_t subgroup_size;
@@ -3137,6 +3148,12 @@ typedef struct nir_lower_tex_options {
     * with nir_texop_txl.  This includes cube maps.
     */
    bool lower_txd_offset_clamp;
+
+   /**
+    * If true, lower nir_texop_txd with min_lod to a nir_texop_txl if the
+    * sampler index is not statically determinable to be less than 16.
+    */
+   bool lower_txd_clamp_if_sampler_index_not_lt_16;
 
    /**
     * If true, apply a .bagr swizzle on tg4 results to handle Broadcom's

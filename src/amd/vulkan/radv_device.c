@@ -111,6 +111,7 @@ radv_get_device_name(enum radeon_family family, char *name, size_t name_len)
 	case CHIP_VEGAM: chip_string = "AMD RADV VEGA M"; break;
 	case CHIP_VEGA10: chip_string = "AMD RADV VEGA10"; break;
 	case CHIP_VEGA12: chip_string = "AMD RADV VEGA12"; break;
+	case CHIP_VEGA20: chip_string = "AMD RADV VEGA20"; break;
 	case CHIP_RAVEN: chip_string = "AMD RADV RAVEN"; break;
 	case CHIP_RAVEN2: chip_string = "AMD RADV RAVEN2"; break;
 	default: chip_string = "AMD RADV unknown"; break;
@@ -337,7 +338,7 @@ radv_physical_device_init(struct radv_physical_device *device,
 	    device->rad_info.chip_class > GFX9)
 		fprintf(stderr, "WARNING: radv is not a conformant vulkan implementation, testing use only.\n");
 
-	radv_get_driver_uuid(&device->device_uuid);
+	radv_get_driver_uuid(&device->driver_uuid);
 	radv_get_device_uuid(&device->rad_info, &device->device_uuid);
 
 	if (device->rad_info.family == CHIP_STONEY ||
@@ -465,6 +466,7 @@ static const struct debug_control radv_debug_options[] = {
 	{"checkir", RADV_DEBUG_CHECKIR},
 	{"nothreadllvm", RADV_DEBUG_NOTHREADLLVM},
 	{"nobinning", RADV_DEBUG_NOBINNING},
+	{"noloadstoreopt", RADV_DEBUG_NO_LOAD_STORE_OPT},
 	{NULL, 0}
 };
 
@@ -510,6 +512,13 @@ radv_handle_per_app_options(struct radv_instance *instance,
 	} else if (!strcmp(name, "DOOM_VFR")) {
 		/* Work around a Doom VFR game bug */
 		instance->debug_flags |= RADV_DEBUG_NO_DYNAMIC_BOUNDS;
+	} else if (!strcmp(name, "MonsterHunterWorld.exe")) {
+		/* Workaround for a WaW hazard when LLVM moves/merges
+		 * load/store memory operations.
+		 * See https://reviews.llvm.org/D61313
+		 */
+		if (HAVE_LLVM < 0x900)
+			instance->debug_flags |= RADV_DEBUG_NO_LOAD_STORE_OPT;
 	}
 }
 
@@ -1002,7 +1011,7 @@ void radv_GetPhysicalDeviceProperties(
 		.maxCullDistances                         = 8,
 		.maxCombinedClipAndCullDistances          = 8,
 		.discreteQueuePriorities                  = 2,
-		.pointSizeRange                           = { 0.125, 255.875 },
+		.pointSizeRange                           = { 0.0, 8192.0 },
 		.lineWidthRange                           = { 0.0, 7.9921875 },
 		.pointSizeGranularity                     = (1.0 / 8.0),
 		.lineWidthGranularity                     = (1.0 / 128.0),
@@ -1380,40 +1389,46 @@ radv_get_memory_budget_properties(VkPhysicalDevice physicalDevice,
 	 * Note that the application heap usages are not really accurate (eg.
 	 * in presence of shared buffers).
 	 */
-	if (vram_size) {
-		heap_usage = device->ws->query_value(device->ws,
-						     RADEON_ALLOCATED_VRAM);
+	for (int i = 0; i < device->memory_properties.memoryTypeCount; i++) {
+		uint32_t heap_index = device->memory_properties.memoryTypes[i].heapIndex;
 
-		heap_budget = vram_size -
-			device->ws->query_value(device->ws, RADEON_VRAM_USAGE) +
-			heap_usage;
+		switch (device->mem_type_indices[i]) {
+		case RADV_MEM_TYPE_VRAM:
+			heap_usage = device->ws->query_value(device->ws,
+							     RADEON_ALLOCATED_VRAM);
 
-		memoryBudget->heapBudget[RADV_MEM_HEAP_VRAM] = heap_budget;
-		memoryBudget->heapUsage[RADV_MEM_HEAP_VRAM] = heap_usage;
-	}
+			heap_budget = vram_size -
+				device->ws->query_value(device->ws, RADEON_VRAM_USAGE) +
+				heap_usage;
 
-	if (visible_vram_size) {
-		heap_usage = device->ws->query_value(device->ws,
-						     RADEON_ALLOCATED_VRAM_VIS);
+			memoryBudget->heapBudget[heap_index] = heap_budget;
+			memoryBudget->heapUsage[heap_index] = heap_usage;
+			break;
+		case RADV_MEM_TYPE_VRAM_CPU_ACCESS:
+			heap_usage = device->ws->query_value(device->ws,
+							     RADEON_ALLOCATED_VRAM_VIS);
 
-		heap_budget = visible_vram_size -
-			device->ws->query_value(device->ws, RADEON_VRAM_VIS_USAGE) +
-			heap_usage;
+			heap_budget = visible_vram_size -
+				device->ws->query_value(device->ws, RADEON_VRAM_VIS_USAGE) +
+				heap_usage;
 
-		memoryBudget->heapBudget[RADV_MEM_HEAP_VRAM_CPU_ACCESS] = heap_budget;
-		memoryBudget->heapUsage[RADV_MEM_HEAP_VRAM_CPU_ACCESS] = heap_usage;
-	}
+			memoryBudget->heapBudget[heap_index] = heap_budget;
+			memoryBudget->heapUsage[heap_index] = heap_usage;
+			break;
+		case RADV_MEM_TYPE_GTT_WRITE_COMBINE:
+			heap_usage = device->ws->query_value(device->ws,
+							     RADEON_ALLOCATED_GTT);
 
-	if (gtt_size) {
-		heap_usage = device->ws->query_value(device->ws,
-						     RADEON_ALLOCATED_GTT);
+			heap_budget = gtt_size -
+				device->ws->query_value(device->ws, RADEON_GTT_USAGE) +
+				heap_usage;
 
-		heap_budget = gtt_size -
-			device->ws->query_value(device->ws, RADEON_GTT_USAGE) +
-			heap_usage;
-
-		memoryBudget->heapBudget[RADV_MEM_HEAP_GTT] = heap_budget;
-		memoryBudget->heapUsage[RADV_MEM_HEAP_GTT] = heap_usage;
+			memoryBudget->heapBudget[heap_index] = heap_budget;
+			memoryBudget->heapUsage[heap_index] = heap_usage;
+			break;
+		default:
+			break;
+		}
 	}
 
 	/* The heapBudget and heapUsage values must be zero for array elements
@@ -2794,7 +2809,7 @@ VkResult radv_QueueSubmit(
 	struct radeon_winsys_fence *base_fence = fence ? fence->fence : NULL;
 	struct radeon_winsys_ctx *ctx = queue->hw_ctx;
 	int ret;
-	uint32_t max_cs_submission = queue->device->trace_bo ? 1 : UINT32_MAX;
+	uint32_t max_cs_submission = queue->device->trace_bo ? 1 : RADV_MAX_IBS_PER_SUBMIT;
 	uint32_t scratch_size = 0;
 	uint32_t compute_scratch_size = 0;
 	uint32_t esgs_ring_size = 0, gsvs_ring_size = 0;
