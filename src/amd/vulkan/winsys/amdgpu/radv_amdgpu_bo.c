@@ -193,7 +193,7 @@ radv_amdgpu_winsys_bo_virtual_bind(struct radeon_winsys_bo *_parent,
 		++first;
 
 	last = first;
-	while(last + 1 < parent->range_count && parent->ranges[last].offset <= offset + size)
+	while(last + 1 < parent->range_count && parent->ranges[last + 1].offset <= offset + size)
 		++last;
 
 	/* Whether the first or last range are going to be totally removed or just
@@ -250,6 +250,7 @@ radv_amdgpu_winsys_bo_virtual_bind(struct radeon_winsys_bo *_parent,
 
 		if (!remove_last) {
 			new_last.size -= offset + size - new_last.offset;
+			new_last.bo_offset += (offset + size - new_last.offset);
 			new_last.offset = offset + size;
 			radv_amdgpu_winsys_virtual_map(parent, &new_last);
 		}
@@ -405,9 +406,17 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws,
 		 * GTT(RAM) usage, which is shared with the OS, allow VRAM
 		 * placements too. The idea is not to use VRAM usefully, but
 		 * to use it so that it's not unused and wasted.
+		 *
+		 * Furthermore, even on discrete GPUs this is beneficial. If
+		 * both GTT and VRAM are set then AMDGPU still prefers VRAM
+		 * for the initial placement, but it makes the buffers
+		 * spillable. Otherwise AMDGPU tries to place the buffers in
+		 * VRAM really hard to the extent that we are getting a lot
+		 * of unnecessary movement. This helps significantly when
+		 * e.g. Horizon Zero Dawn allocates more memory than we have
+		 * VRAM.
 		 */
-		if (!ws->info.has_dedicated_vram)
-			request.preferred_heap |= AMDGPU_GEM_DOMAIN_GTT;
+		request.preferred_heap |= AMDGPU_GEM_DOMAIN_GTT;
 	}
 
 	if (initial_domain & RADEON_DOMAIN_GTT)

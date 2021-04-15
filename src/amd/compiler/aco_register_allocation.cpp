@@ -43,7 +43,7 @@ struct ra_ctx;
 unsigned get_subdword_operand_stride(chip_class chip, const aco_ptr<Instruction>& instr, unsigned idx, RegClass rc);
 void add_subdword_operand(ra_ctx& ctx, aco_ptr<Instruction>& instr, unsigned idx, unsigned byte, RegClass rc);
 std::pair<unsigned, unsigned> get_subdword_definition_info(Program *program, const aco_ptr<Instruction>& instr, RegClass rc);
-void add_subdword_definition(Program *program, aco_ptr<Instruction>& instr, unsigned idx, PhysReg reg, bool is_partial);
+void add_subdword_definition(Program *program, aco_ptr<Instruction>& instr, unsigned idx, PhysReg reg);
 
 struct assignment {
    PhysReg reg;
@@ -154,6 +154,7 @@ public:
       return res;
    }
 
+   /* Returns true if any of the bytes in the given range are allocated or blocked */
    bool test(PhysReg start, unsigned num_bytes) {
       for (PhysReg i = start; i.reg_b < start.reg_b + num_bytes; i = PhysReg(i + 1)) {
          if (regs[i] & 0x0FFFFFFF)
@@ -487,17 +488,16 @@ std::pair<unsigned, unsigned> get_subdword_definition_info(Program *program, con
    return std::make_pair(4u, bytes_written);
 }
 
-void add_subdword_definition(Program *program, aco_ptr<Instruction>& instr, unsigned idx, PhysReg reg, bool is_partial)
+void add_subdword_definition(Program *program, aco_ptr<Instruction>& instr, unsigned idx, PhysReg reg)
 {
    RegClass rc = instr->definitions[idx].regClass();
    chip_class chip = program->chip_class;
 
-   instr->definitions[idx].setFixed(reg);
-
    if (instr->format == Format::PSEUDO) {
       return;
    } else if (can_use_SDWA(chip, instr)) {
-      if (reg.byte() || (is_partial && chip < GFX10))
+      unsigned def_size = instr_info.definition_size[(int)instr->opcode];
+      if (reg.byte() || chip < GFX10 || def_size > rc.bytes() * 8u)
          convert_to_SDWA(chip, instr);
       return;
    } else if (reg.byte() && rc.bytes() == 2 && can_use_opsel(chip, instr->opcode, -1, reg.byte() / 2)) {
@@ -947,15 +947,21 @@ std::pair<PhysReg, bool> get_reg_impl(ra_ctx& ctx,
 
    /* mark and count killed operands */
    unsigned killed_ops = 0;
+   std::bitset<256> is_killed_operand; /* per-register */
    for (unsigned j = 0; !is_phi(instr) && j < instr->operands.size(); j++) {
-      if (instr->operands[j].isTemp() &&
-          instr->operands[j].isFirstKillBeforeDef() &&
-          instr->operands[j].physReg() >= lb &&
-          instr->operands[j].physReg() < ub &&
-          !reg_file.test(instr->operands[j].physReg(), instr->operands[j].bytes())) {
-         assert(instr->operands[j].isFixed());
-         reg_file.block(instr->operands[j].physReg(), instr->operands[j].regClass());
-         killed_ops += instr->operands[j].getTemp().size();
+      Operand& op = instr->operands[j];
+      if (op.isTemp() &&
+          op.isFirstKillBeforeDef() &&
+          op.physReg() >= lb &&
+          op.physReg() < ub &&
+          !reg_file.test(PhysReg{op.physReg().reg()}, align(op.bytes() + op.physReg().byte(), 4))) {
+         assert(op.isFixed());
+
+         for (unsigned i = 0; i < op.size(); ++i) {
+            is_killed_operand[(op.physReg() & 0xff) + i] = true;
+         }
+
+         killed_ops += op.getTemp().size();
       }
    }
 
@@ -992,17 +998,17 @@ std::pair<PhysReg, bool> get_reg_impl(ra_ctx& ctx,
       bool found = true;
       bool aligned = rc == RegClass::v4 && reg_lo % 4 == 0;
       for (unsigned j = reg_lo; found && j <= reg_hi; j++) {
-         if (reg_file[j] == 0 || reg_file[j] == last_var)
-            continue;
-
          /* dead operands effectively reduce the number of estimated moves */
-         if (reg_file.is_blocked(PhysReg{j})) {
+         if (is_killed_operand[j & 0xFF]) {
             if (remaining_op_moves) {
                k--;
                remaining_op_moves--;
             }
             continue;
          }
+
+         if (reg_file[j] == 0 || reg_file[j] == last_var)
+            continue;
 
          if (reg_file[j] == 0xF0000000) {
             k += 1;
@@ -1637,6 +1643,11 @@ Temp handle_live_in(ra_ctx& ctx, Temp val, Block* block)
             phi->operands[i].setFixed(ctx.assignments[ops[i].id()].reg);
             if (ops[i].regClass() == new_val.regClass())
                ctx.affinities[new_val.id()] = ops[i].id();
+            /* make sure the operand gets it's original name in case
+             * it comes from an incomplete phi */
+            std::unordered_map<unsigned, phi_info>::iterator it = ctx.phi_map.find(ops[i].id());
+            if (it != ctx.phi_map.end())
+               it->second.uses.emplace(phi.get());
          }
          ctx.assignments.emplace_back();
          assert(ctx.assignments.size() == ctx.program->peekAllocationId());
@@ -1671,7 +1682,7 @@ void try_remove_trivial_phi(ra_ctx& ctx, Temp temp)
          assert(t == same || op.physReg() == def.physReg());
          continue;
       }
-      if (same != Temp())
+      if (same != Temp() || op.physReg() != def.physReg())
          return;
 
       same = t;
@@ -2202,14 +2213,10 @@ void register_allocation(Program *program, std::vector<IDSet>& live_out_per_bloc
                    !register_file.test(reg, definition->bytes()))
                   definition->setFixed(reg);
             } else if (instr->opcode == aco_opcode::p_extract_vector) {
-               PhysReg reg;
-               if (instr->operands[0].isKillBeforeDef() &&
-                   instr->operands[0].getTemp().type() == definition->getTemp().type()) {
-                  reg = instr->operands[0].physReg();
-                  reg.reg_b += definition->bytes() * instr->operands[1].constantValue();
-                  assert(!register_file.test(reg, definition->bytes()));
+               PhysReg reg = instr->operands[0].physReg();
+               reg.reg_b += definition->bytes() * instr->operands[1].constantValue();
+               if (get_reg_specified(ctx, register_file, definition->regClass(), parallelcopy, instr, reg))
                   definition->setFixed(reg);
-               }
             } else if (instr->opcode == aco_opcode::p_create_vector) {
                PhysReg reg = get_reg_create_vector(ctx, register_file, definition->getTemp(),
                                                    parallelcopy, instr);
@@ -2220,9 +2227,11 @@ void register_allocation(Program *program, std::vector<IDSet>& live_out_per_bloc
                Temp tmp = definition->getTemp();
                if (definition->regClass().is_subdword() && definition->bytes() < 4) {
                   PhysReg reg = get_reg(ctx, register_file, tmp, parallelcopy, instr);
-                  bool partial = !(tmp.bytes() <= 4 && reg.byte() == 0 && !register_file.test(reg, 4));
-                  add_subdword_definition(program, instr, i, reg, partial);
-                  definition = &instr->definitions[i]; /* add_subdword_definition can invalidate the reference */
+                  definition->setFixed(reg);
+                  if (reg.byte() || register_file.test(reg, 4)) {
+                     add_subdword_definition(program, instr, i, reg);
+                     definition = &instr->definitions[i]; /* add_subdword_definition can invalidate the reference */
+                  }
                } else {
                   definition->setFixed(get_reg(ctx, register_file, tmp, parallelcopy, instr));
                }

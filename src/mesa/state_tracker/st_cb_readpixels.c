@@ -235,7 +235,7 @@ try_pbo_readpixels(struct st_context *st, struct st_renderbuffer *strb,
 
    /* Set up the fragment shader */
    {
-      void *fs = st_pbo_get_download_fs(st, view_target, src_format, dst_format);
+      void *fs = st_pbo_get_download_fs(st, view_target, src_format, dst_format, addr.depth != 1);
       if (!fs)
          goto fail;
 
@@ -446,7 +446,7 @@ st_ReadPixels(struct gl_context *ctx, GLint x, GLint y,
 
    /* Convert the source format to what is expected by ReadPixels
     * and see if it's supported. */
-   src_format = util_format_linear(src->format);
+   src_format = util_format_linear(strb->Base.Format);
    src_format = util_format_luminance_to_red(src_format);
    src_format = util_format_intensity_to_red(src_format);
 

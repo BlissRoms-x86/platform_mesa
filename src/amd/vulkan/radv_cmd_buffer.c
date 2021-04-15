@@ -1119,6 +1119,11 @@ radv_emit_rbplus_state(struct radv_cmd_buffer *cmd_buffer)
 			has_alpha = false;
 		}
 
+		/* The HW doesn't quite blend correctly with rgb9e5 if we disable the alpha
+		 * optimization, even though it has no alpha. */
+		if (has_rgb && format == V_028C70_COLOR_5_9_9_9)
+			has_alpha = true;
+
 		/* Disable value checking for disabled channels. */
 		if (!has_rgb)
 			sx_blend_opt_control |= S_02875C_MRT0_COLOR_OPT_DISABLE(1) << (i * 4);
@@ -1185,10 +1190,8 @@ radv_emit_rbplus_state(struct radv_cmd_buffer *cmd_buffer)
 			break;
 
 		case V_028C70_COLOR_10_11_11:
-			if (spi_format == V_028714_SPI_SHADER_FP16_ABGR) {
+			if (spi_format == V_028714_SPI_SHADER_FP16_ABGR)
 				sx_ps_downconvert |= V_028754_SX_RT_EXPORT_10_11_11 << (i * 4);
-				sx_blend_opt_epsilon |= V_028758_11BIT_FORMAT << (i * 4);
-			}
 			break;
 
 		case V_028C70_COLOR_2_10_10_10:
@@ -1581,7 +1584,8 @@ radv_emit_fb_color_state(struct radv_cmd_buffer *cmd_buffer,
 
 	if (radv_image_has_fmask(image) &&
 	    (radv_is_fmask_decompress_pipeline(cmd_buffer) ||
-	     radv_is_hw_resolve_pipeline(cmd_buffer))) {
+	     radv_is_hw_resolve_pipeline(cmd_buffer) ||
+	     radv_is_blit2d_msaa_pipeline(cmd_buffer))) {
 		/* Make sure FMASK is enabled if it has been cleared because:
 		 *
 		 * 1) it's required for FMASK_DECOMPRESS operations to avoid
@@ -1689,7 +1693,7 @@ radv_update_zrange_precision(struct radv_cmd_buffer *cmd_buffer,
 	    !radv_image_is_tc_compat_htile(image))
 		return;
 
-	if (!radv_layout_is_htile_compressed(image, layout, in_render_loop,
+	if (!radv_layout_is_htile_compressed(cmd_buffer->device, image, layout, in_render_loop,
 					     radv_image_queue_family_mask(image,
 									  cmd_buffer->queue_family_index,
 									  cmd_buffer->queue_family_index))) {
@@ -1732,7 +1736,7 @@ radv_emit_fb_ds_state(struct radv_cmd_buffer *cmd_buffer,
 	uint32_t db_z_info = ds->db_z_info;
 	uint32_t db_stencil_info = ds->db_stencil_info;
 
-	if (!radv_layout_is_htile_compressed(image, layout, in_render_loop,
+	if (!radv_layout_is_htile_compressed(cmd_buffer->device, image, layout, in_render_loop,
 					     radv_image_queue_family_mask(image,
 									  cmd_buffer->queue_family_index,
 									  cmd_buffer->queue_family_index))) {
@@ -2230,6 +2234,74 @@ radv_load_color_clear_metadata(struct radv_cmd_buffer *cmd_buffer,
 	}
 }
 
+/* GFX9+ metadata cache flushing workaround. metadata cache coherency is
+ * broken if the CB caches data of multiple mips of the same image at the
+ * same time.
+ *
+ * Insert some flushes to avoid this.
+ */
+static void
+radv_emit_fb_mip_change_flush(struct radv_cmd_buffer *cmd_buffer)
+{
+	struct radv_framebuffer *framebuffer = cmd_buffer->state.framebuffer;
+	const struct radv_subpass *subpass = cmd_buffer->state.subpass;
+	bool color_mip_changed = false;
+
+	/* Entire workaround is not applicable before GFX9 */
+	if (cmd_buffer->device->physical_device->rad_info.chip_class < GFX9)
+		return;
+
+	if (!framebuffer)
+		return;
+
+	for (int i = 0; i < subpass->color_count; ++i) {
+		int idx = subpass->color_attachments[i].attachment;
+		if (idx == VK_ATTACHMENT_UNUSED)
+			continue;
+
+		struct radv_image_view *iview = cmd_buffer->state.attachments[idx].iview;
+
+		if ((radv_image_has_CB_metadata(iview->image) ||
+		     radv_image_has_dcc(iview->image)) &&
+		    cmd_buffer->state.cb_mip[i] != iview->base_mip)
+			color_mip_changed = true;
+
+		cmd_buffer->state.cb_mip[i] = iview->base_mip;
+	}
+
+	if (color_mip_changed) {
+		cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB |
+		                                RADV_CMD_FLAG_FLUSH_AND_INV_CB_META;
+	}
+}
+
+/* This function does the flushes for mip changes if the levels are not zero for
+ * all render targets. This way we can assume at the start of the next cmd_buffer
+ * that rendering to mip 0 doesn't need any flushes. As that is the most common
+ * case that saves some flushes. */
+static void
+radv_emit_mip_change_flush_default(struct radv_cmd_buffer *cmd_buffer)
+{
+	/* Entire workaround is not applicable before GFX9 */
+	if (cmd_buffer->device->physical_device->rad_info.chip_class < GFX9)
+		return;
+
+	bool need_color_mip_flush = false;
+	for (unsigned i = 0; i < 8; ++i) {
+		if (cmd_buffer->state.cb_mip[i]) {
+			need_color_mip_flush = true;
+			break;
+		}
+	}
+
+	if (need_color_mip_flush) {
+		cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_CB |
+		                                RADV_CMD_FLAG_FLUSH_AND_INV_CB_META;
+	}
+
+	memset(cmd_buffer->state.cb_mip, 0, sizeof(cmd_buffer->state.cb_mip));
+}
+
 static void
 radv_emit_framebuffer_state(struct radv_cmd_buffer *cmd_buffer)
 {
@@ -2725,7 +2797,7 @@ radv_flush_vertex_descriptors(struct radv_cmd_buffer *cmd_buffer,
 			}
 
 			if (cmd_buffer->device->physical_device->rad_info.chip_class != GFX8 && stride)
-				num_records /= stride;
+				num_records = DIV_ROUND_UP(num_records, stride);
 
 			uint32_t rsrc_word3 = S_008F0C_DST_SEL_X(V_008F0C_SQ_SEL_X) |
 					      S_008F0C_DST_SEL_Y(V_008F0C_SQ_SEL_Y) |
@@ -4069,6 +4141,8 @@ VkResult radv_EndCommandBuffer(
 {
 	RADV_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
+	radv_emit_mip_change_flush_default(cmd_buffer);
+
 	if (cmd_buffer->queue_family_index != RADV_QUEUE_TRANSFER) {
 		if (cmd_buffer->device->physical_device->rad_info.chip_class == GFX6)
 			cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_WB_L2;
@@ -4179,14 +4253,15 @@ void radv_CmdBindPipeline(
 		/* Prefetch all pipeline shaders at first draw time. */
 		cmd_buffer->state.prefetch_L2_mask |= RADV_PREFETCH_SHADERS;
 
-		if (cmd_buffer->device->physical_device->rad_info.chip_class == GFX10 &&
+		if ((cmd_buffer->device->physical_device->rad_info.chip_class == GFX10 ||
+		     cmd_buffer->device->physical_device->rad_info.family == CHIP_SIENNA_CICHLID) &&
 		    cmd_buffer->state.emitted_pipeline &&
 		    radv_pipeline_has_ngg(cmd_buffer->state.emitted_pipeline) &&
 		    !radv_pipeline_has_ngg(cmd_buffer->state.pipeline)) {
 			/* Transitioning from NGG to legacy GS requires
-			 * VGT_FLUSH on Navi10-14.  VGT_FLUSH is also emitted
-			 * at the beginning of IBs when legacy GS ring pointers
-			 * are set.
+			 * VGT_FLUSH on GFX10 and Sienna Cichlid. VGT_FLUSH
+			 * is also emitted at the beginning of IBs when legacy
+			 * GS ring pointers are set.
 			 */
 			cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_VGT_FLUSH;
 		}
@@ -4648,6 +4723,8 @@ void radv_CmdExecuteCommands(
 
 	assert(commandBufferCount > 0);
 
+	radv_emit_mip_change_flush_default(primary);
+
 	/* Emit pending flushes on primary prior to executing secondary */
 	si_emit_cache_flush(primary);
 
@@ -4680,6 +4757,7 @@ void radv_CmdExecuteCommands(
 			 * has been recorded without a framebuffer, otherwise
 			 * fast color/depth clears can't work.
 			 */
+			radv_emit_fb_mip_change_flush(primary);
 			radv_emit_framebuffer_state(primary);
 		}
 
@@ -5287,6 +5365,10 @@ radv_draw(struct radv_cmd_buffer *cmd_buffer,
 			return;
 	}
 
+	/* Need to apply this workaround early as it can set flush flags. */
+	if (cmd_buffer->state.dirty & RADV_CMD_DIRTY_FRAMEBUFFER)
+		radv_emit_fb_mip_change_flush(cmd_buffer);
+
 	/* Use optimal packet order based on whether we need to sync the
 	 * pipeline.
 	 */
@@ -5867,11 +5949,11 @@ static void radv_handle_depth_image_transition(struct radv_cmd_buffer *cmd_buffe
 
 	if (src_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
 		radv_initialize_htile(cmd_buffer, image, range);
-	} else if (!radv_layout_is_htile_compressed(image, src_layout, src_render_loop, src_queue_mask) &&
-	           radv_layout_is_htile_compressed(image, dst_layout, dst_render_loop, dst_queue_mask)) {
+	} else if (!radv_layout_is_htile_compressed(cmd_buffer->device, image, src_layout, src_render_loop, src_queue_mask) &&
+	           radv_layout_is_htile_compressed(cmd_buffer->device, image, dst_layout, dst_render_loop, dst_queue_mask)) {
 		radv_initialize_htile(cmd_buffer, image, range);
-	} else if (radv_layout_is_htile_compressed(image, src_layout, src_render_loop, src_queue_mask) &&
-	           !radv_layout_is_htile_compressed(image, dst_layout, dst_render_loop, dst_queue_mask)) {
+	} else if (radv_layout_is_htile_compressed(cmd_buffer->device, image, src_layout, src_render_loop, src_queue_mask) &&
+	           !radv_layout_is_htile_compressed(cmd_buffer->device, image, dst_layout, dst_render_loop, dst_queue_mask)) {
 		cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_FLUSH_AND_INV_DB |
 		                                RADV_CMD_FLAG_FLUSH_AND_INV_DB_META;
 
@@ -6131,7 +6213,7 @@ static void radv_handle_image_transition(struct radv_cmd_buffer *cmd_buffer,
 			return;
 	}
 
-	if (src_layout == dst_layout)
+	if (src_layout == dst_layout && src_render_loop == dst_render_loop)
 		return;
 
 	unsigned src_queue_mask =

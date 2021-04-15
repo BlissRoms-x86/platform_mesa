@@ -123,8 +123,10 @@ zink_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
       return screen->timestamp_valid_bits > 0;
 
    case PIPE_CAP_TEXTURE_MULTISAMPLE:
-   case PIPE_CAP_SAMPLE_SHADING:
       return 1;
+
+   case PIPE_CAP_SAMPLE_SHADING:
+      return screen->info.feats.features.sampleRateShading;
 
    case PIPE_CAP_TEXTURE_SWIZZLE:
       return 1;
@@ -136,21 +138,21 @@ zink_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
    case PIPE_CAP_MAX_TEXTURE_CUBE_LEVELS:
       return 1 + util_logbase2(screen->info.props.limits.maxImageDimensionCube);
 
-   case PIPE_CAP_BLEND_EQUATION_SEPARATE:
    case PIPE_CAP_FRAGMENT_SHADER_TEXTURE_LOD:
    case PIPE_CAP_FRAGMENT_SHADER_DERIVATIVES:
    case PIPE_CAP_VERTEX_SHADER_SATURATE:
       return 1;
 
+   case PIPE_CAP_BLEND_EQUATION_SEPARATE:
    case PIPE_CAP_INDEP_BLEND_ENABLE:
    case PIPE_CAP_INDEP_BLEND_FUNC:
-      return 1;
+      return screen->info.feats.features.independentBlend;
 
    case PIPE_CAP_MAX_STREAM_OUTPUT_BUFFERS:
       return screen->info.have_EXT_transform_feedback ? screen->info.tf_props.maxTransformFeedbackBuffers : 0;
    case PIPE_CAP_STREAM_OUTPUT_PAUSE_RESUME:
    case PIPE_CAP_STREAM_OUTPUT_INTERLEAVE_BUFFERS:
-      return 1;
+      return screen->info.have_EXT_transform_feedback;
 
    case PIPE_CAP_MAX_TEXTURE_ARRAY_LAYERS:
       return screen->info.props.limits.maxImageArrayLayers;
@@ -449,7 +451,8 @@ zink_get_shader_param(struct pipe_screen *pscreen,
       return 65536;
 
    case PIPE_SHADER_CAP_MAX_CONST_BUFFERS:
-      return  MIN2(screen->info.props.limits.maxPerStageDescriptorUniformBuffers, INT_MAX);
+      return  MIN2(screen->info.props.limits.maxPerStageDescriptorUniformBuffers,
+                   PIPE_MAX_CONSTANT_BUFFERS);
 
    case PIPE_SHADER_CAP_MAX_TEMPS:
       return INT_MAX;
@@ -773,7 +776,7 @@ static VkPhysicalDevice
 choose_pdev(const VkInstance instance)
 {
    uint32_t i, pdev_count;
-   VkPhysicalDevice *pdevs, pdev;
+   VkPhysicalDevice *pdevs, pdev = NULL;
    vkEnumeratePhysicalDevices(instance, &pdev_count, NULL);
    assert(pdev_count > 0);
 
@@ -781,11 +784,10 @@ choose_pdev(const VkInstance instance)
    vkEnumeratePhysicalDevices(instance, &pdev_count, pdevs);
    assert(pdev_count > 0);
 
-   pdev = pdevs[0];
    for (i = 0; i < pdev_count; ++i) {
       VkPhysicalDeviceProperties props;
       vkGetPhysicalDeviceProperties(pdevs[i], &props);
-      if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+      if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
          pdev = pdevs[i];
          break;
       }
@@ -1088,6 +1090,9 @@ zink_internal_create_screen(struct sw_winsys *winsys, int fd, const struct pipe_
       debug_printf("ZINK: failed to setup debug utils\n");
 
    screen->pdev = choose_pdev(screen->instance);
+   if (!screen->pdev)
+      goto fail;
+
    update_queue_props(screen);
 
    screen->have_X8_D24_UNORM_PACK32 = zink_is_depth_format_supported(screen,

@@ -909,8 +909,10 @@ void anv_DestroyDescriptorPool(
       anv_descriptor_set_layout_unref(device, set->layout);
    }
 
-   if (pool->bo)
+   if (pool->bo) {
+      util_vma_heap_finish(&pool->bo_heap);
       anv_device_release_bo(device, pool->bo);
+   }
    anv_state_stream_finish(&pool->surface_state_stream);
 
    vk_object_base_finish(&pool->base);
@@ -1802,6 +1804,9 @@ void anv_DestroyDescriptorUpdateTemplate(
    ANV_FROM_HANDLE(anv_device, device, _device);
    ANV_FROM_HANDLE(anv_descriptor_update_template, template,
                    descriptorUpdateTemplate);
+
+   if (!template)
+      return;
 
    vk_object_base_finish(&template->base);
    vk_free2(&device->vk.alloc, pAllocator, template);

@@ -89,6 +89,8 @@ void si_get_ir_cache_key(struct si_shader_selector *sel, bool ngg, bool es,
       shader_variant_flags |= 1 << 8;
    if (sel->screen->debug_flags & DBG(GISEL))
       shader_variant_flags |= 1 << 9;
+   if (sel->screen->options.inline_uniforms)
+      shader_variant_flags |= 1 << 11;
 
    struct mesa_sha1 ctx;
    _mesa_sha1_init(&ctx);
@@ -1140,12 +1142,15 @@ static void gfx10_shader_ngg(struct si_screen *sscreen, struct si_shader *shader
    unsigned wave_size = si_get_shader_wave_size(shader);
 
    si_pm4_set_reg(pm4, R_00B320_SPI_SHADER_PGM_LO_ES, va >> 8);
-   si_pm4_set_reg(pm4, R_00B324_SPI_SHADER_PGM_HI_ES, va >> 40);
+   si_pm4_set_reg(pm4, R_00B324_SPI_SHADER_PGM_HI_ES, S_00B324_MEM_BASE(va >> 40));
    si_pm4_set_reg(
       pm4, R_00B228_SPI_SHADER_PGM_RSRC1_GS,
       S_00B228_VGPRS((shader->config.num_vgprs - 1) / (wave_size == 32 ? 8 : 4)) |
          S_00B228_FLOAT_MODE(shader->config.float_mode) | S_00B228_DX10_CLAMP(1) |
-         S_00B228_MEM_ORDERED(1) | S_00B228_WGP_MODE(1) |
+         S_00B228_MEM_ORDERED(1) |
+         /* Disable the WGP mode on gfx10.3 because it can hang. (it happened on VanGogh)
+          * Let's disable it on all chips that disable exactly 1 CU per SA for GS. */
+         S_00B228_WGP_MODE(sscreen->info.chip_class == GFX10) |
          S_00B228_GS_VGPR_COMP_CNT(gs_vgpr_comp_cnt));
    si_pm4_set_reg(pm4, R_00B22C_SPI_SHADER_PGM_RSRC2_GS,
                   S_00B22C_SCRATCH_EN(shader->config.scratch_bytes_per_wave > 0) |
@@ -3024,8 +3029,13 @@ bool si_update_ngg(struct si_context *sctx)
        * VGT_FLUSH is also emitted at the beginning of IBs when legacy GS ring
        * pointers are set.
        */
-      if (sctx->chip_class == GFX10 && !new_ngg)
+      if ((sctx->chip_class == GFX10 || sctx->family == CHIP_SIENNA_CICHLID) && !new_ngg) {
          sctx->flags |= SI_CONTEXT_VGT_FLUSH;
+         if (sctx->chip_class == GFX10) {
+            /* Workaround for https://gitlab.freedesktop.org/mesa/mesa/-/issues/2941 */
+            si_flush_gfx_cs(sctx, RADEON_FLUSH_ASYNC_START_NEXT_GFX_IB_NOW, NULL);
+         }
+      }
 
       sctx->ngg = new_ngg;
       sctx->last_gs_out_prim = -1; /* reset this so that it gets updated */
@@ -4050,6 +4060,10 @@ bool si_update_shaders(struct si_context *sctx)
           sctx->ps_shader.current->key.part.ps.epilog.poly_line_smoothing) {
          sctx->smoothing_enabled = sctx->ps_shader.current->key.part.ps.epilog.poly_line_smoothing;
          si_mark_atom_dirty(sctx, &sctx->atoms.s.msaa_config);
+
+         /* NGG cull state uses smoothing_enabled. */
+         if (sctx->screen->use_ngg_culling)
+            si_mark_atom_dirty(sctx, &sctx->atoms.s.ngg_cull_state);
 
          if (sctx->chip_class == GFX6)
             si_mark_atom_dirty(sctx, &sctx->atoms.s.db_render_state);

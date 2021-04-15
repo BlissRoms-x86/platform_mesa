@@ -46,7 +46,7 @@
  * better GPU utilization.
  *
  * Each accessed BO has a corresponding entry in the ->accessed_bos hash table.
- * A BO is either being written or read at any time (see if writer != NULL).
+ * A BO is either being written or read at any time (see last_is_write).
  * When the last access is a write, the batch writing the BO might have read
  * dependencies (readers that have not been executed yet and want to read the
  * previous BO content), and when the last access is a read, all readers might
@@ -60,6 +60,7 @@
 struct panfrost_bo_access {
         struct util_dynarray readers;
         struct panfrost_batch_fence *writer;
+        bool last_is_write;
 };
 
 static struct panfrost_batch_fence *
@@ -399,7 +400,7 @@ panfrost_batch_update_bo_access(struct panfrost_batch *batch,
         entry = _mesa_hash_table_search(ctx->accessed_bos, bo);
         access = entry ? entry->data : NULL;
         if (access) {
-                old_writes = access->writer != NULL;
+                old_writes = access->last_is_write;
         } else {
                 access = rzalloc(ctx, struct panfrost_bo_access);
                 util_dynarray_init(&access->readers, access);
@@ -479,7 +480,6 @@ panfrost_batch_update_bo_access(struct panfrost_batch *batch,
                         util_dynarray_append(&access->readers,
                                              struct panfrost_batch_fence *,
                                              batch->out_sync);
-                        access->writer = NULL;
                 }
         } else {
                 /* We already accessed this BO before, so we should already be
@@ -504,6 +504,8 @@ panfrost_batch_update_bo_access(struct panfrost_batch *batch,
                 if (access->writer)
                         panfrost_batch_add_dep(batch, access->writer);
         }
+
+        access->last_is_write = writes;
 }
 
 void
@@ -936,6 +938,7 @@ static int
 panfrost_batch_submit_ioctl(struct panfrost_batch *batch,
                             mali_ptr first_job_desc,
                             uint32_t reqs,
+                            uint32_t in_sync,
                             uint32_t out_sync)
 {
         struct panfrost_context *ctx = batch->ctx;
@@ -950,16 +953,16 @@ panfrost_batch_submit_ioctl(struct panfrost_batch *batch,
          * after we're done but preventing double-frees if we were given a
          * syncobj */
 
-        bool our_sync = false;
-
-        if (!out_sync && dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC)) {
-                drmSyncobjCreate(dev->fd, 0, &out_sync);
-                our_sync = true;
-        }
+        if (!out_sync && dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC))
+                out_sync = ctx->syncobj;
 
         submit.out_sync = out_sync;
         submit.jc = first_job_desc;
         submit.requirements = reqs;
+        if (in_sync) {
+                submit.in_syncs = (u64)(uintptr_t)(&in_sync);
+                submit.in_sync_count = 1;
+        }
 
         bo_handles = calloc(panfrost_pool_num_bos(&batch->pool) +
                             panfrost_pool_num_bos(&batch->invisible_pool) +
@@ -975,9 +978,9 @@ panfrost_batch_submit_ioctl(struct panfrost_batch *batch,
         panfrost_pool_get_bo_handles(&batch->invisible_pool, bo_handles + submit.bo_handle_count);
         submit.bo_handle_count += panfrost_pool_num_bos(&batch->invisible_pool);
 
-        /* Used by all tiler jobs (XXX: skip for compute-only) */
-        if (!(reqs & PANFROST_JD_REQ_FS))
-                bo_handles[submit.bo_handle_count++] = dev->tiler_heap->gem_handle;
+        /* Used by all tiler jobs, and occasionally by fragment jobs.
+         * (XXX: skip for compute-only) */
+        bo_handles[submit.bo_handle_count++] = dev->tiler_heap->gem_handle;
 
         submit.bo_handles = (u64) (uintptr_t) bo_handles;
         ret = drmIoctl(dev->fd, DRM_IOCTL_PANFROST_SUBMIT, &submit);
@@ -986,9 +989,6 @@ panfrost_batch_submit_ioctl(struct panfrost_batch *batch,
         if (ret) {
                 if (dev->debug & PAN_DBG_MSGS)
                         fprintf(stderr, "Error submitting: %m\n");
-
-                if (our_sync)
-                        drmSyncobjDestroy(dev->fd, out_sync);
 
                 return errno;
         }
@@ -1004,10 +1004,6 @@ panfrost_batch_submit_ioctl(struct panfrost_batch *batch,
                 pandecode_jc(submit.jc, dev->quirks & IS_BIFROST, dev->gpu_id, minimal);
         }
 
-        /* Cleanup if we created the syncobj */
-        if (our_sync)
-                drmSyncobjDestroy(dev->fd, out_sync);
-
         return 0;
 }
 
@@ -1016,15 +1012,24 @@ panfrost_batch_submit_ioctl(struct panfrost_batch *batch,
  * implicit dep between them) */
 
 static int
-panfrost_batch_submit_jobs(struct panfrost_batch *batch, uint32_t out_sync)
+panfrost_batch_submit_jobs(struct panfrost_batch *batch, uint32_t in_sync, uint32_t out_sync)
 {
+        struct panfrost_device *dev = pan_device(batch->ctx->base.screen);
         bool has_draws = batch->scoreboard.first_job;
-        bool has_frag = batch->scoreboard.tiler_dep || batch->clear;
+        bool has_tiler = batch->scoreboard.first_tiler;
+        bool has_frag = has_tiler || batch->clear;
         int ret = 0;
+
+        /* Take the submit lock to make sure no tiler jobs from other context
+         * are inserted between our tiler and fragment jobs, failing to do that
+         * might result in tiler heap corruption.
+         */
+        if (has_tiler)
+                pthread_mutex_lock(&dev->submit_lock);
 
         if (has_draws) {
                 ret = panfrost_batch_submit_ioctl(batch, batch->scoreboard.first_job,
-                                0, has_frag ? 0 : out_sync);
+                                                  0, in_sync, has_frag ? 0 : out_sync);
                 assert(!ret);
         }
 
@@ -1036,18 +1041,22 @@ panfrost_batch_submit_jobs(struct panfrost_batch *batch, uint32_t out_sync)
                  * *only* clears, since otherwise the tiler structures will be
                  * uninitialized leading to faults (or state leaks) */
 
-                mali_ptr fragjob = panfrost_fragment_job(batch,
-                                batch->scoreboard.tiler_dep != 0);
+                mali_ptr fragjob = panfrost_fragment_job(batch, has_tiler);
                 ret = panfrost_batch_submit_ioctl(batch, fragjob,
-                                PANFROST_JD_REQ_FS, out_sync);
+                                                  PANFROST_JD_REQ_FS, 0,
+                                                  out_sync);
                 assert(!ret);
         }
+
+        if (has_tiler)
+                pthread_mutex_unlock(&dev->submit_lock);
 
         return ret;
 }
 
 static void
-panfrost_batch_submit(struct panfrost_batch *batch, uint32_t out_sync)
+panfrost_batch_submit(struct panfrost_batch *batch,
+                      uint32_t in_sync, uint32_t out_sync)
 {
         assert(batch);
         struct panfrost_device *dev = pan_device(batch->ctx->base.screen);
@@ -1057,17 +1066,14 @@ panfrost_batch_submit(struct panfrost_batch *batch, uint32_t out_sync)
         util_dynarray_foreach(&batch->dependencies,
                               struct panfrost_batch_fence *, dep) {
                 if ((*dep)->batch)
-                        panfrost_batch_submit((*dep)->batch, 0);
+                        panfrost_batch_submit((*dep)->batch, 0, 0);
         }
 
         int ret;
 
         /* Nothing to do! */
-        if (!batch->scoreboard.first_job && !batch->clear) {
-                if (out_sync)
-                        drmSyncobjSignal(dev->fd, &out_sync, 1);
+        if (!batch->scoreboard.first_job && !batch->clear)
                 goto out;
-	}
 
         panfrost_batch_draw_wallpaper(batch);
 
@@ -1090,7 +1096,7 @@ panfrost_batch_submit(struct panfrost_batch *batch, uint32_t out_sync)
 
         panfrost_scoreboard_initialize_tiler(&batch->pool, &batch->scoreboard, polygon_list);
 
-        ret = panfrost_batch_submit_jobs(batch, out_sync);
+        ret = panfrost_batch_submit_jobs(batch, in_sync, out_sync);
 
         if (ret && dev->debug & PAN_DBG_MSGS)
                 fprintf(stderr, "panfrost_batch_submit failed: %d\n", ret);
@@ -1120,16 +1126,16 @@ out:
 /* Submit all batches, applying the out_sync to the currently bound batch */
 
 void
-panfrost_flush_all_batches(struct panfrost_context *ctx, uint32_t out_sync)
+panfrost_flush_all_batches(struct panfrost_context *ctx)
 {
         struct panfrost_batch *batch = panfrost_get_batch_for_fbo(ctx);
-        panfrost_batch_submit(batch, out_sync);
+        panfrost_batch_submit(batch, ctx->syncobj, ctx->syncobj);
 
         hash_table_foreach(ctx->batches, hentry) {
                 struct panfrost_batch *batch = hentry->data;
                 assert(batch);
 
-                panfrost_batch_submit(batch, 0);
+                panfrost_batch_submit(batch, ctx->syncobj, ctx->syncobj);
         }
 
         assert(!ctx->batches->entries);
@@ -1178,7 +1184,7 @@ panfrost_flush_batches_accessing_bo(struct panfrost_context *ctx,
                 return;
 
         if (access->writer && access->writer->batch)
-                panfrost_batch_submit(access->writer->batch, 0);
+                panfrost_batch_submit(access->writer->batch, ctx->syncobj, ctx->syncobj);
 
         if (!flush_readers)
                 return;
@@ -1186,7 +1192,7 @@ panfrost_flush_batches_accessing_bo(struct panfrost_context *ctx,
         util_dynarray_foreach(&access->readers, struct panfrost_batch_fence *,
                               reader) {
                 if (*reader && (*reader)->batch)
-                        panfrost_batch_submit((*reader)->batch, 0);
+                        panfrost_batch_submit((*reader)->batch, ctx->syncobj, ctx->syncobj);
         }
 }
 

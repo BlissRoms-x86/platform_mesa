@@ -271,9 +271,11 @@ st_invalidate_state(struct gl_context *ctx)
                    (ST_NEW_SAMPLER_VIEWS |
                     ST_NEW_SAMPLERS |
                     ST_NEW_IMAGE_UNITS);
-      if (ctx->FragmentProgram._Current &&
-          ctx->FragmentProgram._Current->ExternalSamplersUsed) {
-         st->dirty |= ST_NEW_FS_STATE;
+      if (ctx->FragmentProgram._Current) {
+         struct st_program *stfp = st_program(ctx->FragmentProgram._Current);
+
+         if (stfp->Base.ExternalSamplersUsed || stfp->ati_fs)
+            st->dirty |= ST_NEW_FS_STATE;
       }
    }
 }
@@ -508,7 +510,7 @@ st_init_driver_flags(struct st_context *st)
    f->NewScissorTest = ST_NEW_SCISSOR | ST_NEW_RASTERIZER;
 
    if (st->lower_alpha_test)
-      f->NewAlphaTest = ST_NEW_FS_STATE;
+      f->NewAlphaTest = ST_NEW_FS_STATE | ST_NEW_FS_CONSTANTS;
    else
       f->NewAlphaTest = ST_NEW_DSA;
 

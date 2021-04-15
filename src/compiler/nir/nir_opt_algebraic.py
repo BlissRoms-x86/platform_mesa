@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 #
 # Copyright (C) 2014 Intel Corporation
 #
@@ -264,17 +265,23 @@ for s in [8, 16, 32, 64]:
 # Optimize a pattern of address calculation created by DXVK where the offset is
 # divided by 4 and then multipled by 4. This can be turned into an iand and the
 # additions before can be reassociated to CSE the iand instruction.
+
+for size, mask in ((8, 0xff), (16, 0xffff), (32, 0xffffffff), (64, 0xffffffffffffffff)):
+    a_sz = 'a@{}'.format(size)
+
+    optimizations.extend([
+       # 'a >> #b << #b' -> 'a & ~((1 << #b) - 1)'
+       (('ishl', ('ushr', a_sz, '#b'), b), ('iand', a, ('ishl', mask, b))),
+    ])
+
 for log2 in range(1, 7): # powers of two from 2 to 64
    v = 1 << log2
    mask = 0xffffffff & ~(v - 1)
    b_is_multiple = '#b(is_unsigned_multiple_of_{})'.format(v)
 
    optimizations.extend([
-       # 'a >> #b << #b' -> 'a & ~((1 << #b) - 1)'
-       (('ishl', ('ushr', a, log2), log2), ('iand', a, mask)),
-
        # Reassociate for improved CSE
-       (('iand', ('iadd', a, b_is_multiple), mask), ('iadd', ('iand', a, mask), b)),
+       (('iand@32', ('iadd@32', a, b_is_multiple), mask), ('iadd', ('iand', a, mask), b)),
    ])
 
 # To save space in the state tables, reduce to the set that is known to help.
@@ -349,8 +356,12 @@ optimizations.extend([
    (('fneu', ('fsat(is_used_once)', a), '#b(is_gt_0_and_lt_1)'), ('fneu', a, b)),
 
    (('fge', ('fsat(is_used_once)', a), 1.0), ('fge', a, 1.0)),
-   (('flt', ('fsat(is_used_once)', a), 1.0), ('flt', a, 1.0)),
-   (('fge', 0.0, ('fsat(is_used_once)', a)), ('fge', 0.0, a)),
+   # flt(fsat(a), 1.0) is inexact because it returns True if a is NaN
+   # (fsat(NaN) is 0), while flt(a, 1.0) always returns FALSE.
+   (('~flt', ('fsat(is_used_once)', a), 1.0), ('flt', a, 1.0)),
+   # fge(0.0, fsat(a)) is inexact because it returns True if a is NaN
+   # (fsat(NaN) is 0), while fge(0.0, a) always returns FALSE.
+   (('~fge', 0.0, ('fsat(is_used_once)', a)), ('fge', 0.0, a)),
    (('flt', 0.0, ('fsat(is_used_once)', a)), ('flt', 0.0, a)),
 
    # 0.0 >= b2f(a)
@@ -423,19 +434,6 @@ optimizations.extend([
    (('ieq', ('iadd', a, b), a), ('ieq', b, 0)),
    (('ine', ('iadd', a, b), a), ('ine', b, 0)),
 
-   # fmin(-b2f(a), b) >= 0.0
-   # -b2f(a) >= 0.0 && b >= 0.0
-   # -b2f(a) == 0.0 && b >= 0.0    -b2f can only be 0 or -1, never >0
-   # b2f(a) == 0.0 && b >= 0.0
-   # a == False && b >= 0.0
-   # !a && b >= 0.0
-   #
-   # The fge in the second replacement is not a typo.  I leave the proof that
-   # "fmin(-b2f(a), b) >= 0 <=> fmin(-b2f(a), b) == 0" as an exercise for the
-   # reader.
-   (('fge', ('fmin', ('fneg', ('b2f', 'a@1')), 'b@1'), 0.0), ('iand', ('inot', a), ('fge', b, 0.0))),
-   (('feq', ('fmin', ('fneg', ('b2f', 'a@1')), 'b@1'), 0.0), ('iand', ('inot', a), ('fge', b, 0.0))),
-
    (('feq', ('b2f', 'a@1'), 0.0), ('inot', a)),
    (('~fneu', ('b2f', 'a@1'), 0.0), a),
    (('ieq', ('b2i', 'a@1'), 0),   ('inot', a)),
@@ -483,10 +481,11 @@ optimizations.extend([
    # a != fsat(a)
    (('ior', ('flt', a, 0.0), ('flt', 1.0, a)), ('fneu', a, ('fsat', a)), '!options->lower_fsat'),
 
+   # Note: fmin(-a, -b) == -fmax(a, b)
    (('fmax',                        ('b2f(is_used_once)', 'a@1'),           ('b2f', 'b@1')),           ('b2f', ('ior', a, b))),
-   (('fmax', ('fneg(is_used_once)', ('b2f(is_used_once)', 'a@1')), ('fneg', ('b2f', 'b@1'))), ('fneg', ('b2f', ('ior', a, b)))),
+   (('fmax', ('fneg(is_used_once)', ('b2f(is_used_once)', 'a@1')), ('fneg', ('b2f', 'b@1'))), ('fneg', ('b2f', ('iand', a, b)))),
    (('fmin',                        ('b2f(is_used_once)', 'a@1'),           ('b2f', 'b@1')),           ('b2f', ('iand', a, b))),
-   (('fmin', ('fneg(is_used_once)', ('b2f(is_used_once)', 'a@1')), ('fneg', ('b2f', 'b@1'))), ('fneg', ('b2f', ('iand', a, b)))),
+   (('fmin', ('fneg(is_used_once)', ('b2f(is_used_once)', 'a@1')), ('fneg', ('b2f', 'b@1'))), ('fneg', ('b2f', ('ior', a, b)))),
 
    # fmin(b2f(a), b)
    # bcsel(a, fmin(b2f(a), b), fmin(b2f(a), b))
@@ -639,8 +638,6 @@ optimizations.extend([
 
 # Float sizes
 for s in [16, 32, 64]:
-    fp_one = {16: 0x3c00, 32: 0x3f800000, 64: 0x3ff0000000000000}[s]
-
     optimizations.extend([
        # These derive from the previous patterns with the application of b < 0 <=>
        # 0 < -b.  The transformation should be applied if either comparison is
@@ -656,11 +653,28 @@ for s in [16, 32, 64]:
        (('~iand', ('fge(is_used_once)', 0.0, 'a@{}'.format(s)), ('fge', 'b@{}'.format(s), 0.0)), ('fge', 0.0, ('fmax', a, ('fneg', b)))),
        (('~iand', ('fge', 0.0, 'a@{}'.format(s)), ('fge(is_used_once)', 'b@{}'.format(s), 0.0)), ('fge', 0.0, ('fmax', a, ('fneg', b)))),
 
-       # The (i2f32, ...) part is an open-coded fsign.  When that is combined with
-       # the bcsel, it's basically copysign(1.0, a).  There is no copysign in NIR,
-       # so emit an open-coded version of that.
+       # The (i2f32, ...) part is an open-coded fsign.  When that is combined
+       # with the bcsel, it's basically copysign(1.0, a).  There are some
+       # behavior differences between this pattern and copysign w.r.t. ±0 and
+       # NaN.  copysign(x, y) blindly takes the sign bit from y and applies it
+       # to x, regardless of whether either or both values are NaN.
+       #
+       # If a != a: bcsel(False, 1.0, i2f(b2i(False) - b2i(False))) = 0,
+       #            int(NaN >= 0.0) - int(NaN < 0.0) = 0 - 0 = 0
+       # If a == ±0: bcsel(True, 1.0, ...) = 1.0,
+       #            int(±0.0 >= 0.0) - int(±0.0 < 0.0) = 1 - 0 = 1
+       #
+       # For all other values of 'a', the original and replacement behave as
+       # copysign.
+       #
+       # Marking the replacement comparisons as precise prevents any future
+       # optimizations from replacing either of the comparisons with the
+       # logical-not of the other.
+       #
+       # Note: Use b2i32 in the replacement because some platforms that
+       # support fp16 don't support int16.
        (('bcsel@{}'.format(s), ('feq', a, 0.0), 1.0, ('i2f{}'.format(s), ('iadd', ('b2i{}'.format(s), ('flt', 0.0, 'a@{}'.format(s))), ('ineg', ('b2i{}'.format(s), ('flt', 'a@{}'.format(s), 0.0)))))),
-        ('ior', fp_one, ('iand', a, 1 << (s - 1)))),
+        ('i2f{}'.format(s), ('iadd', ('b2i32', ('!fge', a, 0.0)), ('ineg', ('b2i32', ('!flt', a, 0.0)))))),
 
        (('bcsel', a, ('b2f(is_used_once)', 'b@{}'.format(s)), ('b2f', 'c@{}'.format(s))), ('b2f', ('bcsel', a, b, c))),
 
@@ -984,12 +998,21 @@ optimizations.extend([
    (('ieq(is_not_used_by_if)', a, False), ('inot', 'a')),
    (('bcsel', a, True, False), a),
    (('bcsel', a, False, True), ('inot', a)),
-   (('bcsel', a, 1.0, 0.0), ('b2f', a)),
-   (('bcsel', a, 0.0, 1.0), ('b2f', ('inot', a))),
-   (('bcsel', a, -1.0, -0.0), ('fneg', ('b2f', a))),
-   (('bcsel', a, -0.0, -1.0), ('fneg', ('b2f', ('inot', a)))),
    (('bcsel', True, b, c), b),
    (('bcsel', False, b, c), c),
+
+   (('bcsel@16', a, 1.0, 0.0), ('b2f', a)),
+   (('bcsel@16', a, 0.0, 1.0), ('b2f', ('inot', a))),
+   (('bcsel@16', a, -1.0, -0.0), ('fneg', ('b2f', a))),
+   (('bcsel@16', a, -0.0, -1.0), ('fneg', ('b2f', ('inot', a)))),
+   (('bcsel@32', a, 1.0, 0.0), ('b2f', a)),
+   (('bcsel@32', a, 0.0, 1.0), ('b2f', ('inot', a))),
+   (('bcsel@32', a, -1.0, -0.0), ('fneg', ('b2f', a))),
+   (('bcsel@32', a, -0.0, -1.0), ('fneg', ('b2f', ('inot', a)))),
+   (('bcsel@64', a, 1.0, 0.0), ('b2f', a), '!(options->lower_doubles_options & nir_lower_fp64_full_software)'),
+   (('bcsel@64', a, 0.0, 1.0), ('b2f', ('inot', a)), '!(options->lower_doubles_options & nir_lower_fp64_full_software)'),
+   (('bcsel@64', a, -1.0, -0.0), ('fneg', ('b2f', a)), '!(options->lower_doubles_options & nir_lower_fp64_full_software)'),
+   (('bcsel@64', a, -0.0, -1.0), ('fneg', ('b2f', ('inot', a))), '!(options->lower_doubles_options & nir_lower_fp64_full_software)'),
 
    (('bcsel', a, b, b), b),
    (('~fcsel', a, b, b), b),
@@ -2052,10 +2075,15 @@ late_optimizations = [
    # new patterns like these.  The patterns that compare with zero are removed
    # because they are unlikely to be created in by anything in
    # late_optimizations.
-   (('flt', ('fsat(is_used_once)', a), '#b(is_gt_0_and_lt_1)'), ('flt', a, b)),
+
+   # flt(fsat(a), b > 0 && b < 1) is inexact if a is NaN (fsat(NaN) is 0)
+   # because it returns True while flt(a, b) always returns False.
+   (('~flt', ('fsat(is_used_once)', a), '#b(is_gt_0_and_lt_1)'), ('flt', a, b)),
    (('flt', '#b(is_gt_0_and_lt_1)', ('fsat(is_used_once)', a)), ('flt', b, a)),
    (('fge', ('fsat(is_used_once)', a), '#b(is_gt_0_and_lt_1)'), ('fge', a, b)),
-   (('fge', '#b(is_gt_0_and_lt_1)', ('fsat(is_used_once)', a)), ('fge', b, a)),
+   # fge(b > 0 && b < 1, fsat(a)) is inexact if a is NaN (fsat(NaN) is 0)
+   # because it returns True while fge(b, a) always returns False.
+   (('~fge', '#b(is_gt_0_and_lt_1)', ('fsat(is_used_once)', a)), ('fge', b, a)),
    (('feq', ('fsat(is_used_once)', a), '#b(is_gt_0_and_lt_1)'), ('feq', a, b)),
    (('fneu', ('fsat(is_used_once)', a), '#b(is_gt_0_and_lt_1)'), ('fneu', a, b)),
 

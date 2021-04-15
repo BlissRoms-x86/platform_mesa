@@ -553,6 +553,9 @@ anv_get_image_format_features(const struct gen_device_info *devinfo,
                VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
                VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
 
+      if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
+         flags |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+
       if ((aspects & VK_IMAGE_ASPECT_DEPTH_BIT) && devinfo->gen >= 9)
          flags |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT_EXT;
 
@@ -920,6 +923,31 @@ anv_get_image_format_properties(
    if (info->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) {
       if (!(format_feature_flags & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
          goto unsupported;
+      }
+   }
+
+   if (info->flags & VK_IMAGE_CREATE_DISJOINT_BIT) {
+      /* From the Vulkan 1.2.149 spec, VkImageCreateInfo:
+       *
+       *    If format is a multi-planar format, and if imageCreateFormatFeatures
+       *    (as defined in Image Creation Limits) does not contain
+       *    VK_FORMAT_FEATURE_DISJOINT_BIT, then flags must not contain
+       *    VK_IMAGE_CREATE_DISJOINT_BIT.
+       */
+      if (format->n_planes > 1 &&
+          !(format_feature_flags & VK_FORMAT_FEATURE_DISJOINT_BIT)) {
+         goto unsupported;
+      }
+
+      /* From the Vulkan 1.2.149 spec, VkImageCreateInfo:
+       *
+       * If format is not a multi-planar format, and flags does not include
+       * VK_IMAGE_CREATE_ALIAS_BIT, flags must not contain
+       * VK_IMAGE_CREATE_DISJOINT_BIT.
+       */
+      if (format->n_planes == 1 &&
+          !(info->flags & VK_IMAGE_CREATE_ALIAS_BIT)) {
+          goto unsupported;
       }
    }
 

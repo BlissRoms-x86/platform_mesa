@@ -358,6 +358,8 @@ struct radv_instance {
 	 * Workarounds for game bugs.
 	 */
 	bool enable_mrt_output_nan_fixup;
+	bool disable_tc_compat_htile_in_general;
+	bool disable_shrink_image_store;
 };
 
 VkResult radv_init_wsi(struct radv_physical_device *physical_device);
@@ -821,8 +823,9 @@ struct radv_device {
 	struct radv_device_extension_table enabled_extensions;
 	struct radv_device_dispatch_table dispatch;
 
-	/* Whether the app has enabled the robustBufferAccess feature. */
+	/* Whether the app has enabled the robustBufferAccess/robustBufferAccess2 features. */
 	bool robust_buffer_access;
+	bool robust_buffer_access2;
 
 	/* Whether the driver uses a global BO list. */
 	bool use_global_bo_list;
@@ -1389,6 +1392,8 @@ struct radv_cmd_state {
 	uint32_t num_layout_transitions;
 	bool pending_sqtt_barrier_end;
 	enum rgp_flush_bits sqtt_flush_bits;
+
+	uint8_t cb_mip[MAX_RTS];
 };
 
 struct radv_cmd_pool {
@@ -1649,6 +1654,7 @@ struct radv_shader_module;
 #define RADV_HASH_SHADER_LLVM                (1 << 4)
 #define RADV_HASH_SHADER_DISCARD_TO_DEMOTE   (1 << 5)
 #define RADV_HASH_SHADER_MRT_NAN_FIXUP       (1 << 6)
+#define RADV_HASH_SHADER_INVARIANT_GEOM      (1 << 7)
 
 void
 radv_hash_shaders(unsigned char *hash,
@@ -1899,7 +1905,8 @@ struct radv_image {
  * If this is false reads that don't use the htile should be able to return
  * correct results.
  */
-bool radv_layout_is_htile_compressed(const struct radv_image *image,
+bool radv_layout_is_htile_compressed(const struct radv_device *device,
+				     const struct radv_image *image,
                                      VkImageLayout layout,
                                      bool in_render_loop,
                                      unsigned queue_mask);

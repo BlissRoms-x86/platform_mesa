@@ -281,11 +281,8 @@ panfrost_shader_compile(struct panfrost_context *ctx,
         state->sysval_count = program->sysval_count;
         memcpy(state->sysval, program->sysvals, sizeof(state->sysval[0]) * state->sysval_count);
 
-        bool vertex_id = s->info.system_values_read & (1 << SYSTEM_VALUE_VERTEX_ID);
-        bool instance_id = s->info.system_values_read & (1 << SYSTEM_VALUE_INSTANCE_ID);
-
-        /* On Bifrost it's a sysval, on Midgard it's a varying */
-        state->reads_frag_coord = s->info.system_values_read & (1 << SYSTEM_VALUE_FRAG_COORD);
+        bool vertex_id = BITSET_TEST(s->info.system_values_read, SYSTEM_VALUE_VERTEX_ID);
+        bool instance_id = BITSET_TEST(s->info.system_values_read, SYSTEM_VALUE_INSTANCE_ID);
 
         state->writes_global = s->info.writes_memory;
 
@@ -342,10 +339,11 @@ panfrost_shader_compile(struct panfrost_context *ctx,
         state->helper_invocations = s->info.fs.needs_helper_invocations;
         state->stack_size = program->tls_size;
 
-        state->reads_frag_coord = s->info.inputs_read & (1 << VARYING_SLOT_POS);
+        state->reads_frag_coord = (s->info.inputs_read & (1 << VARYING_SLOT_POS)) ||
+                                  BITSET_TEST(s->info.system_values_read, SYSTEM_VALUE_FRAG_COORD);
         state->reads_point_coord = s->info.inputs_read & (1 << VARYING_SLOT_PNTC);
         state->reads_face = (s->info.inputs_read & (1 << VARYING_SLOT_FACE)) ||
-                            (s->info.system_values_read & (1 << SYSTEM_VALUE_FRONT_FACE));
+                            BITSET_TEST(s->info.system_values_read, SYSTEM_VALUE_FRONT_FACE);
         state->writes_point_size = s->info.outputs_written & (1 << VARYING_SLOT_PSIZ);
 
         if (outputs_written)

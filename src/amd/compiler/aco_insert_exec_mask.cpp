@@ -165,6 +165,8 @@ void mark_block_wqm(wqm_ctx &ctx, unsigned block_idx)
       return;
 
    ctx.branch_wqm[block_idx] = true;
+   ctx.worklist.insert(block_idx);
+
    Block& block = ctx.program->blocks[block_idx];
 
    /* TODO: this sets more branch conditions to WQM than it needs to
@@ -190,8 +192,6 @@ void get_block_needs(wqm_ctx &ctx, exec_ctx &exec_ctx, Block* block)
              * the conditions might be computed outside the nested CF */
             if (ctx.program->blocks[block_idx].kind & block_kind_break)
                mark_block_wqm(ctx, block_idx);
-            /* flag all blocks as WQM to ensure we enter all (nested) loops in WQM */
-            exec_ctx.info[block_idx].block_needs |= WQM;
             block_idx++;
          }
       } else if (ctx.loop && !ctx.wqm) {
@@ -214,7 +214,8 @@ void get_block_needs(wqm_ctx &ctx, exec_ctx &exec_ctx, Block* block)
       aco_ptr<Instruction>& instr = block->instructions[i];
 
       WQMState needs = needs_exact(instr) ? Exact : Unspecified;
-      bool propagate_wqm = instr->opcode == aco_opcode::p_wqm;
+      bool propagate_wqm = instr->opcode == aco_opcode::p_wqm ||
+                           instr->opcode == aco_opcode::p_as_uniform;
       bool preserve_wqm = instr->opcode == aco_opcode::p_discard_if;
       bool pred_by_exec = pred_by_exec_mask(instr);
       for (const Definition& definition : instr->definitions) {

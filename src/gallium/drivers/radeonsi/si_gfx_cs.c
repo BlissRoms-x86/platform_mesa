@@ -424,6 +424,10 @@ void si_begin_new_gfx_cs(struct si_context *ctx, bool first_cs)
    ctx->flags |= SI_CONTEXT_INV_ICACHE | SI_CONTEXT_INV_SCACHE | SI_CONTEXT_INV_VCACHE |
                  SI_CONTEXT_INV_L2 | SI_CONTEXT_START_PIPELINE_STATS;
 
+   /* We don't know if the last draw call used GS fast launch, so assume it didn't. */
+   if (ctx->ngg_culling & SI_NGG_CULL_GS_FAST_LAUNCH_ALL)
+      ctx->flags |= SI_CONTEXT_VGT_FLUSH;
+
    radeon_add_to_buffer_list(ctx, ctx->gfx_cs, ctx->border_color_buffer,
                              RADEON_USAGE_READ, RADEON_PRIO_BORDER_COLORS);
    if (ctx->shadowed_regs) {
@@ -490,15 +494,14 @@ void si_begin_new_gfx_cs(struct si_context *ctx, bool first_cs)
       ctx->framebuffer.dirty_cbufs = u_bit_consecutive(0, 8);
       ctx->framebuffer.dirty_zsbuf = true;
    }
-   /* This should always be marked as dirty to set the framebuffer scissor
-    * at least.
-    *
-    * Even with shadowed registers, we have to add buffers to the buffer list.
-    * All of these do that.
+
+   /* Even with shadowed registers, we have to add buffers to the buffer list.
+    * These atoms are the only ones that add buffers.
     */
    si_mark_atom_dirty(ctx, &ctx->atoms.s.framebuffer);
    si_mark_atom_dirty(ctx, &ctx->atoms.s.render_cond);
-   si_mark_atom_dirty(ctx, &ctx->atoms.s.viewports);
+   if (ctx->screen->use_ngg_culling)
+      si_mark_atom_dirty(ctx, &ctx->atoms.s.ngg_cull_state);
 
    if (first_cs || !ctx->shadowed_regs) {
       /* These don't add any buffers, so skip them with shadowing. */
@@ -528,6 +531,7 @@ void si_begin_new_gfx_cs(struct si_context *ctx, bool first_cs)
          si_mark_atom_dirty(ctx, &ctx->atoms.s.window_rectangles);
       si_mark_atom_dirty(ctx, &ctx->atoms.s.guardband);
       si_mark_atom_dirty(ctx, &ctx->atoms.s.scissors);
+      si_mark_atom_dirty(ctx, &ctx->atoms.s.viewports);
 
       /* Invalidate various draw states so that they are emitted before
        * the first draw call. */
@@ -572,7 +576,6 @@ void si_begin_new_gfx_cs(struct si_context *ctx, bool first_cs)
 
    assert(!ctx->gfx_cs->prev_dw);
    ctx->initial_gfx_cs_size = ctx->gfx_cs->current.cdw;
-   ctx->small_prim_cull_info_dirty = ctx->small_prim_cull_info_buf != NULL;
    ctx->prim_discard_compute_ib_initialized = false;
 
    /* Compute-based primitive discard:

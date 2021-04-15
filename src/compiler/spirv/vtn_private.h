@@ -663,6 +663,13 @@ struct vtn_builder {
     */
    struct hash_table *phi_table;
 
+   /* In Vulkan, when lowering some modes variable access, the derefs of the
+    * variables are replaced with a resource index intrinsics, leaving the
+    * variable hanging.  This set keeps track of them so they can be filtered
+    * (and not removed) in nir_remove_dead_variables.
+    */
+   struct set *vars_used_indirectly;
+
    unsigned num_specializations;
    struct nir_spirv_specialization *specializations;
 
@@ -693,7 +700,19 @@ struct vtn_builder {
    unsigned func_param_idx;
 
    bool has_loop_continue;
-   bool has_kill;
+
+   /** True if this shader has any early termination instructions like OpKill
+    *
+    * In the SPIR-V, the following instructions are block terminators:
+    *
+    *  - OpKill
+    *  - OpTerminateInvocation
+    *
+    * However, in NIR, they're represented by regular intrinsics with no
+    * control-flow semantics.  This means that the SSA form from the SPIR-V
+    * may not 100% match NIR and we have to fix it up at the end.
+    */
+   bool has_early_terminate;
 
    /* false by default, set to true by the ContractionOff execution mode */
    bool exact;
@@ -884,7 +903,7 @@ void vtn_foreach_execution_mode(struct vtn_builder *b, struct vtn_value *value,
                                 vtn_execution_mode_foreach_cb cb, void *data);
 
 nir_op vtn_nir_alu_op_for_spirv_opcode(struct vtn_builder *b,
-                                       SpvOp opcode, bool *swap,
+                                       SpvOp opcode, bool *swap, bool *exact,
                                        unsigned src_bit_size, unsigned dst_bit_size);
 
 void vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,

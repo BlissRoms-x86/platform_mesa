@@ -685,7 +685,10 @@ dri2_lookup_egl_image(__DRIscreen *screen, void *image, void *data)
 
    (void) screen;
 
+   mtx_lock(&disp->Mutex);
    img = _eglLookupImage(image, disp);
+   mtx_unlock(&disp->Mutex);
+
    if (img == NULL) {
       _eglError(EGL_BAD_PARAMETER, "dri2_lookup_egl_image");
       return NULL;
@@ -1018,7 +1021,7 @@ dri2_setup_screen(_EGLDisplay *disp)
    if (dri2_dpy->buffer_damage && dri2_dpy->buffer_damage->set_damage_region)
       disp->Extensions.KHR_partial_update = EGL_TRUE;
 
-   disp->Extensions.EXT_protected_content =
+   disp->Extensions.EXT_protected_surface =
       dri2_renderer_query_integer(dri2_dpy,
                                   __DRI2_RENDERER_HAS_PROTECTED_CONTENT);
 }

@@ -167,8 +167,8 @@ void radv_DestroyShaderModule(
 }
 
 void
-radv_optimize_nir(struct nir_shader *shader, bool optimize_conservatively,
-                  bool allow_copies)
+radv_optimize_nir(const struct radv_device *device, struct nir_shader *shader,
+		  bool optimize_conservatively, bool allow_copies)
 {
         bool progress;
         unsigned lower_flrp =
@@ -238,7 +238,8 @@ radv_optimize_nir(struct nir_shader *shader, bool optimize_conservatively,
                 }
 
                 NIR_PASS(progress, shader, nir_opt_undef);
-                NIR_PASS(progress, shader, nir_opt_shrink_vectors);
+                NIR_PASS(progress, shader, nir_opt_shrink_vectors,
+                         !device->instance->disable_shrink_image_store);
                 if (shader->options->max_unroll_iterations) {
                         NIR_PASS(progress, shader, nir_opt_loop_unroll, 0);
                 }
@@ -309,6 +310,27 @@ static void radv_compiler_debug(void *private_data,
 			VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT,
 			(uint64_t)(uintptr_t)debug_data->module,
 			0, 0, "radv", message);
+}
+
+static void
+mark_geom_invariant(nir_shader *nir)
+{
+	nir_foreach_shader_out_variable(var, nir) {
+		switch (var->data.location) {
+		case VARYING_SLOT_POS:
+		case VARYING_SLOT_PSIZ:
+		case VARYING_SLOT_CLIP_DIST0:
+		case VARYING_SLOT_CLIP_DIST1:
+		case VARYING_SLOT_CULL_DIST0:
+		case VARYING_SLOT_CULL_DIST1:
+		case VARYING_SLOT_TESS_LEVEL_OUTER:
+		case VARYING_SLOT_TESS_LEVEL_INNER:
+			var->data.invariant = true;
+			break;
+		default:
+			break;
+		}
+	}
 }
 
 static bool
@@ -528,6 +550,11 @@ radv_shader_compile_to_nir(struct radv_device *device,
 		           nir_var_shader_in | nir_var_shader_out | nir_var_system_value | nir_var_mem_shared,
 			   NULL);
 
+		if (device->instance->debug_flags & RADV_DEBUG_INVARIANT_GEOM &&
+		    stage != MESA_SHADER_FRAGMENT) {
+			mark_geom_invariant(nir);
+		}
+
 		NIR_PASS_V(nir, nir_propagate_invariant);
 
 		NIR_PASS_V(nir, nir_lower_system_values);
@@ -611,7 +638,7 @@ radv_shader_compile_to_nir(struct radv_device *device,
 	nir_lower_load_const_to_scalar(nir);
 
 	if (!(flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT))
-		radv_optimize_nir(nir, false, true);
+		radv_optimize_nir(device, nir, false, true);
 
 	/* call radv_nir_lower_ycbcr_textures() late as there might still be
 	 * tex with undef texture/sampler before first optimization */
@@ -658,7 +685,7 @@ radv_shader_compile_to_nir(struct radv_device *device,
 	    !(flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) &&
 	    nir->info.stage != MESA_SHADER_COMPUTE) {
 		/* Optimize the lowered code before the linking optimizations. */
-		radv_optimize_nir(nir, false, false);
+		radv_optimize_nir(device, nir, false, false);
 	}
 
 	return nir;
@@ -938,7 +965,7 @@ static void radv_postprocess_config(const struct radv_device *device,
 					     S_00B12C_EXCP_EN(excp_en);
 		}
 		config_out->rsrc1 |= S_00B428_MEM_ORDERED(pdevice->rad_info.chip_class >= GFX10) |
-				     S_00B848_WGP_MODE(pdevice->rad_info.chip_class >= GFX10);
+				     S_00B428_WGP_MODE(pdevice->rad_info.chip_class >= GFX10);
 		config_out->rsrc2 |= S_00B42C_SHARED_VGPR_CNT(num_shared_vgpr_blocks);
 		break;
 	case MESA_SHADER_VERTEX:
@@ -982,8 +1009,7 @@ static void radv_postprocess_config(const struct radv_device *device,
 				     S_00B02C_EXCP_EN(excp_en);
 		break;
 	case MESA_SHADER_GEOMETRY:
-		config_out->rsrc1 |= S_00B228_MEM_ORDERED(pdevice->rad_info.chip_class >= GFX10) |
-				     S_00B848_WGP_MODE(pdevice->rad_info.chip_class >= GFX10);
+		config_out->rsrc1 |= S_00B228_MEM_ORDERED(pdevice->rad_info.chip_class >= GFX10);
 		config_out->rsrc2 |= S_00B22C_SHARED_VGPR_CNT(num_shared_vgpr_blocks) |
 				     S_00B22C_EXCP_EN(excp_en);
 		break;
@@ -1036,7 +1062,7 @@ static void radv_postprocess_config(const struct radv_device *device,
 		}
 
 		config_out->rsrc1 |= S_00B228_GS_VGPR_COMP_CNT(gs_vgpr_comp_cnt) |
-				     S_00B228_WGP_MODE(1);
+				     S_00B228_WGP_MODE(pdevice->rad_info.chip_class == GFX10);
 		config_out->rsrc2 |= S_00B22C_ES_VGPR_COMP_CNT(es_vgpr_comp_cnt) |
 				     S_00B22C_LDS_SIZE(config_in->lds_size) |
 				     S_00B22C_OC_LDS_EN(es_stage == MESA_SHADER_TESS_EVAL);
@@ -1071,7 +1097,8 @@ static void radv_postprocess_config(const struct radv_device *device,
 			gs_vgpr_comp_cnt = 0; /* VGPR0 contains offsets 0, 1 */
 		}
 
-		config_out->rsrc1 |= S_00B228_GS_VGPR_COMP_CNT(gs_vgpr_comp_cnt);
+		config_out->rsrc1 |= S_00B228_GS_VGPR_COMP_CNT(gs_vgpr_comp_cnt) |
+				     S_00B228_WGP_MODE(pdevice->rad_info.chip_class >= GFX10);
 		config_out->rsrc2 |= S_00B22C_ES_VGPR_COMP_CNT(es_vgpr_comp_cnt) |
 		                         S_00B22C_OC_LDS_EN(es_type == MESA_SHADER_TESS_EVAL);
 	} else if (pdevice->rad_info.chip_class >= GFX9 &&
@@ -1147,6 +1174,10 @@ radv_shader_variant_create(struct radv_device *device,
 		if (rtld_binary.lds_size > 0) {
 			unsigned alloc_granularity = device->physical_device->rad_info.chip_class >= GFX7 ? 512 : 256;
 			config.lds_size = align(rtld_binary.lds_size, alloc_granularity) / alloc_granularity;
+		}
+		if (!config.lds_size && binary->stage == MESA_SHADER_TESS_CTRL) {
+			/* This is used for reporting LDS statistics */
+			config.lds_size = binary->info.tcs.num_lds_blocks;
 		}
 
 		variant->code_size = rtld_binary.rx_size;
@@ -1279,7 +1310,8 @@ shader_variant_compile(struct radv_device *device,
 	options->address32_hi = device->physical_device->rad_info.address32_hi;
 	options->has_ls_vgpr_init_bug = device->physical_device->rad_info.has_ls_vgpr_init_bug;
 	options->use_ngg_streamout = device->physical_device->use_ngg_streamout;
-	options->enable_mrt_output_nan_fixup = device->instance->enable_mrt_output_nan_fixup;
+	options->enable_mrt_output_nan_fixup = module && !module->nir &&
+					       device->instance->enable_mrt_output_nan_fixup;
 	options->debug.func = radv_compiler_debug;
 	options->debug.private_data = &debug_data;
 
@@ -1368,6 +1400,7 @@ radv_shader_variant_compile(struct radv_device *device,
 
 	options.explicit_scratch_args = !radv_use_llvm_for_stage(device, stage);
 	options.robust_buffer_access = device->robust_buffer_access;
+	options.robust_buffer_access2 = device->robust_buffer_access2;
 	options.disable_optimizations = disable_optimizations;
 
 	return shader_variant_compile(device, module, shaders, shader_count, stage, info,

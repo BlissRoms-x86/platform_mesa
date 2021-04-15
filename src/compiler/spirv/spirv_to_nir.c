@@ -2094,9 +2094,16 @@ vtn_handle_constant(struct vtn_builder *b, SpvOp opcode,
             bit_size = glsl_get_bit_size(val->type->type);
          };
 
-         nir_op op = vtn_nir_alu_op_for_spirv_opcode(b, opcode, &swap,
+         bool exact;
+         nir_op op = vtn_nir_alu_op_for_spirv_opcode(b, opcode, &swap, &exact,
                                                      nir_alu_type_get_type_size(src_alu_type),
                                                      nir_alu_type_get_type_size(dst_alu_type));
+
+         /* No SPIR-V opcodes handled through this path should set exact.
+          * Since it is ignored, assert on it.
+          */
+         assert(!exact);
+
          nir_const_value src[3][NIR_MAX_VEC_COMPONENTS];
 
          for (unsigned i = 0; i < count - 4; i++) {
@@ -2159,7 +2166,10 @@ vtn_handle_constant(struct vtn_builder *b, SpvOp opcode,
    }
 
    /* Now that we have the value, update the workgroup size if needed */
-   vtn_foreach_decoration(b, val, handle_workgroup_size_decoration_cb, NULL);
+   if (b->entry_point_stage == MESA_SHADER_COMPUTE ||
+       b->entry_point_stage == MESA_SHADER_KERNEL)
+      vtn_foreach_decoration(b, val, handle_workgroup_size_decoration_cb,
+                             NULL);
 }
 
 static void
@@ -3076,6 +3086,7 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
       break;
 
    case SpvOpImageQuerySize:
+   case SpvOpImageQuerySamples:
       res_val = vtn_untyped_value(b, w[3]);
       image.image = vtn_get_image(b, w[3], &access);
       image.coord = NULL;
@@ -3205,6 +3216,7 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
    OP(AtomicFAddEXT,             atomic_fadd)
    OP(ImageQueryFormat,          format)
    OP(ImageQueryOrder,           order)
+   OP(ImageQuerySamples,         samples)
 #undef OP
    default:
       vtn_fail_with_opcode("Invalid image opcode", opcode);
@@ -3215,6 +3227,7 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
    intrin->src[0] = nir_src_for_ssa(&image.image->dest.ssa);
 
    switch (opcode) {
+   case SpvOpImageQuerySamples:
    case SpvOpImageQuerySize:
    case SpvOpImageQuerySizeLod:
    case SpvOpImageQueryFormat:
@@ -3246,6 +3259,7 @@ vtn_handle_image(struct vtn_builder *b, SpvOp opcode,
    nir_intrinsic_set_access(intrin, access);
 
    switch (opcode) {
+   case SpvOpImageQuerySamples:
    case SpvOpImageQueryFormat:
    case SpvOpImageQueryOrder:
       /* No additional sources */
@@ -5202,7 +5216,6 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
    case SpvOpImageDrefGather:
    case SpvOpImageQueryLod:
    case SpvOpImageQueryLevels:
-   case SpvOpImageQuerySamples:
       vtn_handle_texture(b, opcode, w, count);
       break;
 
@@ -5214,6 +5227,7 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
       vtn_handle_image(b, opcode, w, count);
       break;
 
+   case SpvOpImageQuerySamples:
    case SpvOpImageQuerySizeLod:
    case SpvOpImageQuerySize: {
       struct vtn_type *image_type = vtn_get_value_type(b, w[3]);
@@ -5633,6 +5647,9 @@ vtn_create_builder(const uint32_t *words, size_t word_count,
    b->value_id_bound = value_id_bound;
    b->values = rzalloc_array(b, struct vtn_value, value_id_bound);
 
+   if (b->options->environment == NIR_SPIRV_VULKAN)
+      b->vars_used_indirectly = _mesa_pointer_set_create(b);
+
    return b;
  fail:
    ralloc_free(b);
@@ -5708,6 +5725,13 @@ vtn_emit_kernel_entry_point_wrapper(struct vtn_builder *b,
    nir_builder_instr_insert(&b->nb, &call->instr);
 
    return main_entry_point;
+}
+
+static bool
+can_remove(nir_variable *var, void *data)
+{
+   const struct set *vars_used_indirectly = data;
+   return !_mesa_set_search(vars_used_indirectly, var);
 }
 
 nir_shader *
@@ -5791,6 +5815,7 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
                                  vtn_handle_execution_mode_id, NULL);
 
    if (b->workgroup_size_builtin) {
+      vtn_assert(stage == MESA_SHADER_COMPUTE || stage == MESA_SHADER_KERNEL);
       vtn_assert(b->workgroup_size_builtin->type->type ==
                  glsl_vector_type(GLSL_TYPE_UINT, 3));
 
@@ -5841,19 +5866,28 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
    /* structurize the CFG */
    nir_lower_goto_ifs(b->shader);
 
-   /* When multiple shader stages exist in the same SPIR-V module, we
-    * generate input and output variables for every stage, in the same
-    * NIR program.  These dead variables can be invalid NIR.  For example,
-    * TCS outputs must be per-vertex arrays (or decorated 'patch'), while
-    * VS output variables wouldn't be.
+   /* A SPIR-V module can have multiple shaders stages and also multiple
+    * shaders of the same stage.  Global variables are declared per-module, so
+    * they are all collected when parsing a single shader.  These dead
+    * variables can result in invalid NIR, e.g.
     *
-    * To ensure we have valid NIR, we eliminate any dead inputs and outputs
-    * right away.  In order to do so, we must lower any constant initializers
-    * on outputs so nir_remove_dead_variables sees that they're written to.
+    * - TCS outputs must be per-vertex arrays (or decorated 'patch'), while VS
+    *   output variables wouldn't be;
+    * - Two vertex shaders have two different typed blocks associated to the
+    *   same Binding.
+    *
+    * Before cleaning the dead variables, we must lower any constant
+    * initializers on outputs so nir_remove_dead_variables sees that they're
+    * written to.
     */
-   nir_lower_variable_initializers(b->shader, nir_var_shader_out);
-   nir_remove_dead_variables(b->shader,
-                             nir_var_shader_in | nir_var_shader_out, NULL);
+   nir_lower_variable_initializers(b->shader, nir_var_shader_out |
+                                              nir_var_system_value);
+   const nir_remove_dead_variables_options dead_opts = {
+      .can_remove_var = can_remove,
+      .can_remove_var_data = b->vars_used_indirectly,
+   };
+   nir_remove_dead_variables(b->shader, ~nir_var_function_temp,
+                             b->vars_used_indirectly ? &dead_opts : NULL);
 
    /* We sometimes generate bogus derefs that, while never used, give the
     * validator a bit of heartburn.  Run dead code to get rid of them.
