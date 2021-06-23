@@ -905,8 +905,15 @@ anv_physical_device_try_create(struct anv_instance *instance,
    device->always_flush_cache =
       driQueryOptionb(&instance->dri_options, "always_flush_cache");
 
+#if defined(ANDROID)
+   /* Android kernel still has some issues to support
+    * mmap_offset on 32 bit, hardcode to legacy mode
+    */
+   device->has_mmap_offset = false;
+#else
    device->has_mmap_offset =
       anv_gem_get_param(fd, I915_PARAM_MMAP_GTT_VERSION) >= 4;
+#endif
 
    /* GENs prior to 8 do not support EU/Subslice info */
    device->subslice_total = intel_device_info_subslice_total(&device->info);
